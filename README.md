@@ -52,32 +52,26 @@ knows how to talk to it (OWUI exposes an OpenAI-compatible `/api/chat/completion
 
 ### Browser SSO login (recommended)
 
-The primary auth method uses browser-based SSO/OIDC flow. When you run:
+The primary auth method opens a browser-based SSO/OIDC flow. Run:
 
 ```bash
-opencode auth login openwebui
+bun src/cli.ts login https://your-openwebui-instance.example.org
 ```
 
-opencode prompts for the OpenWebUI base URL, then opens a local browser bridge
-page. The bridge guides you through:
+This starts a local HTTP server and opens a bridge page in your browser that
+guides you through:
 
 1. SSO/OIDC sign-in in your browser
 2. Token extraction via `copy(localStorage.token)` in the browser console
-3. Automatic token POST back to the local server
+3. Pasting the token back into the bridge page
 
-opencode shows a spinner while waiting for the token. This avoids manual
-cookie copying and handles SSO flows that require browser context.
+The CLI waits for the token, validates it, and saves the account automatically.
 
-Alternatively, use the CLI directly:
-
-```bash
-bunx opencode-openwebui-auth login <baseUrl>
-```
-
-Or set the `OWUI_BASE_URL` environment variable as a fallback:
+You can also set `OWUI_BASE_URL` so you don't have to type the URL every time:
 
 ```bash
-OWUI_BASE_URL=https://your-openwebui-instance.example.org opencode auth login openwebui
+export OWUI_BASE_URL=https://your-openwebui-instance.example.org
+bun src/cli.ts login
 ```
 
 ### Manual token (fallback)
@@ -85,7 +79,7 @@ OWUI_BASE_URL=https://your-openwebui-instance.example.org opencode auth login op
 For non-SSO setups or when the browser flow fails, manually paste your JWT:
 
 ```bash
-bunx opencode-openwebui-auth add <baseUrl> <token>
+bun src/cli.ts add https://your-openwebui-instance.example.org <paste-jwt-here>
 ```
 
 To get the token manually:
@@ -94,6 +88,8 @@ To get the token manually:
 3. Run the `add` command above
 
 ## CLI commands
+
+All commands are run via `bun src/cli.ts <command>`:
 
 ```
 login [baseUrl]           Sign in via browser (SSO/OIDC) — opens your browser
@@ -120,7 +116,7 @@ bun run format            # format with Biome
 
 ## Environment variables
 
-- `OWUI_BASE_URL` — base URL for OpenWebUI instance (fallback when not prompted/provided as arg)
+- `OWUI_BASE_URL` — base URL for OpenWebUI instance (fallback when not provided as arg)
 - `OPENWEBUI_AUTH_DEBUG=verbose` — enable debug logging to stderr
 
 ## How it works
@@ -136,7 +132,7 @@ bun run format            # format with Biome
   token returns an error with instructions to re-auth — OWUI does not expose a
   refresh endpoint for user JWTs, so you re-authenticate when it expires.
 - The browser SSO flow uses a local HTTP server and bridge page to extract tokens
-  from the browser after OIDC/SSO sign-in, then POSTs them back to opencode.
+  from the browser after OIDC/SSO sign-in, then POSTs them back to the CLI.
 
 ## Logs
 

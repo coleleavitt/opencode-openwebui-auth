@@ -40,8 +40,8 @@ async function cmdLogin(args: string[]): Promise<void> {
     const baseUrlArg = args[0] ?? process.env.OWUI_BASE_URL;
     if (!baseUrlArg) {
         console.error(
-            "Usage: opencode-openwebui-auth login <baseUrl>\n" +
-                "  e.g. opencode-openwebui-auth login https://chat.example.org\n\n" +
+            "Usage: bun src/cli.ts login <baseUrl>\n" +
+                "  e.g. bun src/cli.ts login https://chat.example.org\n\n" +
                 "Or set OWUI_BASE_URL in your environment.",
         );
         process.exit(1);
