@@ -8,6 +8,8 @@ Useful when the models (Anthropic, Bedrock, OpenAI, etc.) are not directly
 reachable from your machine but are exposed through an OWUI deployment you
 already have a browser session for — e.g. a university or company LLM gateway.
 
+Zero runtime dependencies — bundles into a single ESM file.
+
 ## Install
 
 ```bash
@@ -24,7 +26,7 @@ knows how to talk to it (OWUI exposes an OpenAI-compatible `/api/chat/completion
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
-    "file:///home/you/WebstormProjects/opencode-openwebui-auth/dist/bundle.js"
+    "file:///home/you/opencode-openwebui-auth/dist/bundle.js"
   ],
   "provider": {
     "openwebui": {
@@ -46,31 +48,80 @@ knows how to talk to it (OWUI exposes an OpenAI-compatible `/api/chat/completion
 }
 ```
 
-## Grab a token
+## Authentication
 
-1. Open your OpenWebUI instance in a browser and sign in.
-2. DevTools → Application → Cookies → copy the value of the `token` cookie.
+### Browser SSO login (recommended)
 
-## Add the account
-
-```bash
-bun src/cli.ts add https://your-openwebui-instance.example.org <paste-jwt-here>
-```
-
-Or in opencode:
+The primary auth method uses browser-based SSO/OIDC flow. When you run:
 
 ```bash
 opencode auth login openwebui
 ```
 
-## Useful commands
+opencode prompts for the OpenWebUI base URL, then opens a local browser bridge
+page. The bridge guides you through:
+
+1. SSO/OIDC sign-in in your browser
+2. Token extraction via `copy(localStorage.token)` in the browser console
+3. Automatic token POST back to the local server
+
+opencode shows a spinner while waiting for the token. This avoids manual
+cookie copying and handles SSO flows that require browser context.
+
+Alternatively, use the CLI directly:
 
 ```bash
-bun src/cli.ts list               # list accounts
-bun src/cli.ts use <name>         # switch current
-bun src/cli.ts models             # list models available to your user
-bun src/cli.ts whoami             # verify token
+bunx opencode-openwebui-auth login <baseUrl>
 ```
+
+Or set the `OWUI_BASE_URL` environment variable as a fallback:
+
+```bash
+OWUI_BASE_URL=https://your-openwebui-instance.example.org opencode auth login openwebui
+```
+
+### Manual token (fallback)
+
+For non-SSO setups or when the browser flow fails, manually paste your JWT:
+
+```bash
+bunx opencode-openwebui-auth add <baseUrl> <token>
+```
+
+To get the token manually:
+1. Open your OpenWebUI instance in a browser and sign in
+2. DevTools → Application → Local Storage → copy the value of `token`
+3. Run the `add` command above
+
+## CLI commands
+
+```
+login [baseUrl]           Sign in via browser (SSO/OIDC) — opens your browser
+add <baseUrl> <token>     Add/update an OpenWebUI account (manual token paste)
+list                      List configured accounts
+use <name>                Set the current account
+remove <name>             Delete an account
+models [name]             List models for the given (or current) account
+whoami                    Print the current account and verify token
+```
+
+## Build commands
+
+```bash
+bun install
+bun run build             # typecheck + bundle plugin + bundle CLI
+bun run build:typecheck   # typecheck only (no emit)
+bun run build:bundle      # bundle only (skip typecheck)
+bun run dev               # watch mode typecheck
+bun run lint              # lint with Biome
+bun run lint:fix          # lint + auto-fix
+bun run format            # format with Biome
+```
+
+## Environment variables
+
+- `OWUI_BASE_URL` — base URL for OpenWebUI instance (fallback when not prompted/provided as arg)
+- `OPENWEBUI_AUTH_DEBUG=verbose` — enable debug logging to stderr
 
 ## How it works
 
@@ -83,7 +134,9 @@ bun src/cli.ts whoami             # verify token
   accounting shows up in opencode's stats.
 - JWT expiry is checked locally (exp claim) before every request; an expired
   token returns an error with instructions to re-auth — OWUI does not expose a
-  refresh endpoint for user JWTs, so you re-paste when it expires.
+  refresh endpoint for user JWTs, so you re-authenticate when it expires.
+- The browser SSO flow uses a local HTTP server and bridge page to extract tokens
+  from the browser after OIDC/SSO sign-in, then POSTs them back to opencode.
 
 ## Logs
 
@@ -95,3 +148,5 @@ bun src/cli.ts whoami             # verify token
 - Zero keys are stored in the code. The only secret is your personal JWT,
   persisted at `~/.config/opencode/openwebui-accounts.json` with mode `0600`.
 - The plugin never sends the JWT to anything other than the configured `baseUrl`.
+- The browser SSO flow uses a local HTTP server (localhost only) with a short-lived
+  bridge page — no external servers are involved in the authentication flow.
