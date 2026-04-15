@@ -1,7 +1,7 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { isTokenExpired } from "../oauth/jwt";
 import { log, logRequest, logResponse } from "../logger";
+import { isTokenExpired } from "../oauth/jwt";
 import type { Storage } from "../storage";
 import type { OpenWebUIAccount } from "../types";
 
@@ -15,11 +15,18 @@ try {
 
 function bodyLog(path: string, entry: Record<string, unknown>): void {
     try {
-        appendFileSync(path, `${JSON.stringify({ ts: new Date().toISOString(), ...entry })}\n`);
+        appendFileSync(
+            path,
+            `${JSON.stringify({ ts: new Date().toISOString(), ...entry })}\n`,
+        );
     } catch {}
 }
 
-const OWUI_SENSITIVE_HEADERS = new Set(["x-api-key", "anthropic-version", "anthropic-beta"]);
+const OWUI_SENSITIVE_HEADERS = new Set([
+    "x-api-key",
+    "anthropic-version",
+    "anthropic-beta",
+]);
 
 const DUMMY_TOOL = {
     type: "function",
@@ -109,25 +116,37 @@ function rewriteBody(
         model: (scrubbed as Record<string, unknown>).model,
         stream: (scrubbed as Record<string, unknown>).stream,
         msgs: Array.isArray((scrubbed as Record<string, unknown>).messages)
-            ? ((scrubbed as Record<string, unknown>).messages as unknown[]).length
+            ? ((scrubbed as Record<string, unknown>).messages as unknown[])
+                  .length
             : 0,
         tools: Array.isArray((scrubbed as Record<string, unknown>).tools)
             ? ((scrubbed as Record<string, unknown>).tools as unknown[]).length
             : 0,
-        tool_choice: (scrubbed as Record<string, unknown>).tool_choice ?? "<absent>",
+        tool_choice:
+            (scrubbed as Record<string, unknown>).tool_choice ?? "<absent>",
         orig_tools: Array.isArray((original as Record<string, unknown>).tools)
             ? ((original as Record<string, unknown>).tools as unknown[]).length
             : 0,
-        orig_tool_choice: (original as Record<string, unknown>).tool_choice ?? "<absent>",
+        orig_tool_choice:
+            (original as Record<string, unknown>).tool_choice ?? "<absent>",
     });
-    return { init: { ...init, body: JSON.stringify(scrubbed) }, original, rewritten: scrubbed };
+    return {
+        init: { ...init, body: JSON.stringify(scrubbed) },
+        original,
+        rewritten: scrubbed,
+    };
 }
 
-function buildHeaders(init: RequestInit | undefined, account: OpenWebUIAccount): Headers {
+function buildHeaders(
+    init: RequestInit | undefined,
+    account: OpenWebUIAccount,
+): Headers {
     const headers = new Headers();
     if (init?.headers) {
         if (init.headers instanceof Headers) {
-            init.headers.forEach((value, key) => headers.set(key, value));
+            init.headers.forEach((value, key) => {
+                headers.set(key, value);
+            });
         } else if (Array.isArray(init.headers)) {
             for (const [key, value] of init.headers) {
                 if (value !== undefined) headers.set(key, String(value));
@@ -141,7 +160,10 @@ function buildHeaders(init: RequestInit | undefined, account: OpenWebUIAccount):
     for (const name of OWUI_SENSITIVE_HEADERS) headers.delete(name);
     headers.set("authorization", `Bearer ${account.token}`);
     headers.set("accept", headers.get("accept") ?? "application/json");
-    headers.set("content-type", headers.get("content-type") ?? "application/json");
+    headers.set(
+        "content-type",
+        headers.get("content-type") ?? "application/json",
+    );
     return headers;
 }
 
@@ -181,7 +203,8 @@ export function makeOwuiFetch(storage: Storage) {
         if (isTokenExpired(account.token, 0)) {
             log(`[fetch] token expired for ${account.name} (exp check)`);
             throw new Error(
-                `Token for ${account.name} is expired. Re-run: opencode auth login openwebui`,
+                `Token for ${account.name} is expired. Re-authenticate: opencode auth login openwebui` +
+                    " (or run: opencode-openwebui-auth login)",
             );
         }
 
@@ -198,7 +221,11 @@ export function makeOwuiFetch(storage: Storage) {
             try {
                 const clone = res.clone();
                 const text = await clone.text();
-                bodyLog(RES_LOG, { url: url.toString(), status: res.status, body: text });
+                bodyLog(RES_LOG, {
+                    url: url.toString(),
+                    status: res.status,
+                    body: text,
+                });
             } catch {}
         }
         return res;
