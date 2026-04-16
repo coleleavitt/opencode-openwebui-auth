@@ -13,6 +13,9 @@
  *   6. GET  /oauth/oidc/callback           → Open WebUI exchanges code for JWT
  */
 
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { homedir } from "node:os";
 import { log } from "../logger";
 
 /* ------------------------------------------------------------------ */
@@ -80,11 +83,60 @@ class CookieJar {
     get(domain: string, name: string): string | undefined {
         return this.cookies.get(domain)?.get(name);
     }
+
+    serialize(): Record<string, Record<string, string>> {
+        const out: Record<string, Record<string, string>> = {};
+        for (const [domain, jar] of this.cookies) {
+            out[domain] = Object.fromEntries(jar);
+        }
+        return out;
+    }
+
+    static deserialize(data: Record<string, Record<string, string>>): CookieJar {
+        const jar = new CookieJar();
+        for (const [domain, cookies] of Object.entries(data)) {
+            jar.cookies.set(domain, new Map(Object.entries(cookies)));
+        }
+        return jar;
+    }
 }
 
 /* ------------------------------------------------------------------ */
 /*  HTTP helpers                                                       */
 /* ------------------------------------------------------------------ */
+
+const COOKIE_JAR_PATH = join(homedir(), ".config", "opencode", "openwebui-cookies.json");
+
+function saveCookieJar(jar: CookieJar): void {
+    try {
+        mkdirSync(dirname(COOKIE_JAR_PATH), { recursive: true });
+        const data = JSON.stringify({ v: 1, ts: Date.now(), cookies: jar.serialize() });
+        const tmp = `${COOKIE_JAR_PATH}.tmp-${process.pid}`;
+        writeFileSync(tmp, data, { mode: 0o600 });
+        renameSync(tmp, COOKIE_JAR_PATH);
+        log("[oidc] Saved cookie jar for session reuse");
+    } catch (err) {
+        log(`[oidc] Failed to save cookie jar: ${err instanceof Error ? err.message : err}`);
+    }
+}
+
+function loadCookieJar(): CookieJar | null {
+    try {
+        if (!existsSync(COOKIE_JAR_PATH)) return null;
+        const raw = JSON.parse(readFileSync(COOKIE_JAR_PATH, "utf8"));
+        if (raw.v !== 1 || !raw.cookies) return null;
+        const ageMs = Date.now() - (raw.ts ?? 0);
+        if (ageMs > 24 * 60 * 60 * 1000) {
+            log("[oidc] Persisted cookie jar older than 24h — ignoring");
+            return null;
+        }
+        const jar = CookieJar.deserialize(raw.cookies);
+        log(`[oidc] Loaded persisted cookie jar (age=${Math.round(ageMs / 60000)}min)`);
+        return jar;
+    } catch {
+        return null;
+    }
+}
 
 const UA = "Mozilla/5.0 (X11; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0";
 
@@ -203,7 +255,7 @@ async function step2_submitCredentials(
     shibUrl: string,
     username: string,
     password: string,
-): Promise<{ url: string; body: string }> {
+): Promise<{ url: string; body: string; skippedCredentials: boolean }> {
     log("[oidc] Step 2a: Fetching localStorage probe (e1s1)");
     const { body: probeHtml, url: probeUrl } = await followRedirects(jar, shibUrl);
 
@@ -225,7 +277,15 @@ async function step2_submitCredentials(
     let loginUrl = probeRes.url;
     log(`[oidc] Step 2a: Advanced to ${loginUrl}`);
 
+    // If Shibboleth session is still alive, it skips the login form entirely
+    // and redirects straight to the Duo handoff or the OIDC callback.
     if (!loginHtml.includes("j_username") || !loginHtml.includes("j_password")) {
+        if (loginUrl.includes("Duo") || loginUrl.includes("duo")
+            || loginUrl.includes("execution=e1s3") || loginUrl.includes("oauth/oidc/callback")
+            || loginHtml.includes("duo_form") || loginHtml.includes("duosecurity.com")) {
+            log("[oidc] Step 2: Shibboleth session alive — skipping credential submission");
+            return { url: loginUrl, body: loginHtml, skippedCredentials: true };
+        }
         throw new Error(
             `Step 2a: Expected login form with j_username/j_password on ${loginUrl}`,
         );
@@ -254,7 +314,7 @@ async function step2_submitCredentials(
         throw new Error("Step 2b: Login failed — invalid NetID or password");
     }
 
-    return { url: afterLogin, body };
+    return { url: afterLogin, body, skippedCredentials: false };
 }
 
 /**
@@ -872,22 +932,28 @@ async function step5and6_completeShibbolethAndExtractToken(
  * @returns Fresh Open WebUI JWT + metadata
  */
 export async function oidcLogin(opts: OidcLoginOptions): Promise<OidcLoginResult> {
-    const jar = new CookieJar();
+    const jar = loadCookieJar() ?? new CookieJar();
     const baseUrl = opts.baseUrl.replace(/\/$/, "");
 
-    // Step 1: Initiate OIDC
     const shibUrl = await step1_initiateOidc(jar, baseUrl);
 
-    // Step 2: Submit credentials
-    const { url: afterCreds, body: afterCredsBody } = await step2_submitCredentials(
-        jar, shibUrl, opts.username, opts.password,
-    );
+    const { url: afterCreds, body: afterCredsBody, skippedCredentials } =
+        await step2_submitCredentials(jar, shibUrl, opts.username, opts.password);
 
-    // Step 3: Navigate to Duo
+    if (afterCreds.includes("oauth/oidc/callback") || afterCreds.includes(`${baseUrl}/auth`)) {
+        log("[oidc] Session fully alive — Shibboleth skipped straight to OIDC callback");
+        const result = await step5and6_completeShibbolethAndExtractToken(jar, afterCreds, baseUrl);
+        saveCookieJar(jar);
+        return result;
+    }
+
     const { duoAuthorizeUrl, duoBody } = await step3_navigateToDuo(jar, afterCreds, afterCredsBody);
-
-    // Step 4: Complete Duo 2FA
     const duoCallbackUrl = await step4_completeDuo(jar, duoAuthorizeUrl, duoBody, opts);
+    const result = await step5and6_completeShibbolethAndExtractToken(jar, duoCallbackUrl, baseUrl);
 
-    return step5and6_completeShibbolethAndExtractToken(jar, duoCallbackUrl, baseUrl);
+    saveCookieJar(jar);
+    if (skippedCredentials) {
+        log("[oidc] Shibboleth session was reused (credentials skipped), Duo still required");
+    }
+    return result;
 }
