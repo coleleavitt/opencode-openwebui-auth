@@ -7,18 +7,23 @@ import type { Storage } from "../storage";
 import type { OpenWebUIAccount } from "../types";
 
 const BODY_LOG_DIR = "/tmp/opencode-openwebui-auth";
-const REQ_LOG = join(BODY_LOG_DIR, "requests.log");
 const RES_LOG = join(BODY_LOG_DIR, "responses.log");
 const SUMMARY_LOG = join(BODY_LOG_DIR, "summary.log");
 try {
     mkdirSync(BODY_LOG_DIR, { recursive: true });
 } catch {}
 
+const VERBOSE_BODY_LOG = process.env.OPENWEBUI_AUTH_DEBUG === "verbose";
+
 function bodyLog(path: string, entry: Record<string, unknown>): void {
     try {
         appendFileSync(path, `${JSON.stringify({ ts: new Date().toISOString(), ...entry })}\n`);
     } catch {}
 }
+
+const RETRY_STATUSES = new Set([502, 503, 504]);
+const MAX_RETRIES = 2;
+const RETRY_BASE_MS = 1500;
 
 const OWUI_SENSITIVE_HEADERS = new Set(["x-api-key", "anthropic-version", "anthropic-beta"]);
 
@@ -104,7 +109,9 @@ function rewriteBody(
     }
     const original = JSON.parse(JSON.stringify(parsed));
     const scrubbed = scrubBedrockToolFields(parsed);
-    bodyLog(REQ_LOG, { url, original, scrubbed });
+    if (VERBOSE_BODY_LOG) {
+        bodyLog(join(BODY_LOG_DIR, "requests.log"), { url, original, scrubbed });
+    }
     bodyLog(SUMMARY_LOG, {
         url,
         model: (scrubbed as Record<string, unknown>).model,
@@ -217,18 +224,48 @@ export function makeOwuiFetch(storage: Storage) {
         const headers = buildHeaders(init, account);
         const { init: rewritten } = rewriteBody(init, url.toString());
 
-        logRequest(url.toString(), init?.method ?? "GET");
-        const res = await fetch(url, { ...rewritten, headers });
-        logResponse(url.toString(), res.status);
+        let lastRes: Response | undefined;
+        for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+            if (attempt > 0) {
+                const delay = RETRY_BASE_MS * 2 ** (attempt - 1);
+                log(`[fetch] retry #${attempt} in ${delay}ms after ${lastRes?.status ?? "?"}...`);
+                await new Promise((r) => setTimeout(r, delay));
+            }
 
-        // On non-2xx, clone and capture the response body for debugging
-        if (!res.ok) {
-            try {
-                const clone = res.clone();
-                const text = await clone.text();
-                bodyLog(RES_LOG, { url: url.toString(), status: res.status, body: text });
-            } catch {}
+            logRequest(url.toString(), init?.method ?? "GET");
+            const res = await fetch(url, { ...rewritten, headers });
+            logResponse(url.toString(), res.status);
+            lastRes = res;
+
+            if (res.ok) return res;
+
+            if (RETRY_STATUSES.has(res.status) && attempt < MAX_RETRIES) {
+                try {
+                    const text = await res.text();
+                    bodyLog(RES_LOG, { url: url.toString(), status: res.status, body: text.slice(0, 500), attempt });
+                } catch {}
+                continue;
+            }
+
+            if (!res.ok) {
+                try {
+                    const clone = res.clone();
+                    const text = await clone.text();
+                    bodyLog(RES_LOG, { url: url.toString(), status: res.status, body: text.slice(0, 2000) });
+
+                    if (text.includes("<html") || text.includes("<!DOCTYPE")) {
+                        const errorJson = JSON.stringify({
+                            error: { message: `Upstream error ${res.status} (nginx/proxy)`, type: "proxy_error", code: res.status },
+                        });
+                        return new Response(errorJson, {
+                            status: res.status,
+                            headers: { "Content-Type": "application/json" },
+                        });
+                    }
+                } catch {}
+            }
+            return res;
         }
-        return res;
+        return lastRes!;
     };
 }

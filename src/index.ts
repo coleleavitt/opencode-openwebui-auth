@@ -181,10 +181,10 @@ export const OpenWebUIAuthPlugin = async (_input: PluginInput) => {
             output: { options: Record<string, unknown> },
         ) => {
             if (input.provider.id !== PROVIDER_ID) return;
-            output.options = {
-                ...(output.options ?? {}),
-                stream_options: { include_usage: true },
-            };
+            // @ai-sdk/openai-compatible adds include_usage via its own `includeUsage`
+            // option (set in provider.ts:1264). Do NOT add stream_options here — OWUI
+            // passes it through to LiteLLM → Bedrock which rejects unknown fields,
+            // causing truncated responses or silent failures.
         },
     };
 };
