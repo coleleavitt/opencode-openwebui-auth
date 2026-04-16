@@ -22,8 +22,11 @@ function bodyLog(path: string, entry: Record<string, unknown>): void {
 }
 
 const RETRY_STATUSES = new Set([502, 503, 504]);
+const AUTH_RETRY_STATUSES = new Set([401, 403]);
 const MAX_RETRIES = 2;
 const RETRY_BASE_MS = 1500;
+const STREAM_TIMEOUT_S = 600;
+const SAFETY_TIMEOUT_MS = 10 * 60 * 1000;
 
 const OWUI_SENSITIVE_HEADERS = new Set(["x-api-key", "anthropic-version", "anthropic-beta"]);
 
@@ -131,7 +134,7 @@ function rewriteBody(
     return { init: { ...init, body: JSON.stringify(scrubbed) }, original, rewritten: scrubbed };
 }
 
-function buildHeaders(init: RequestInit | undefined, account: OpenWebUIAccount): Headers {
+function buildHeaders(init: RequestInit | undefined, account: OpenWebUIAccount, isStreaming: boolean): Headers {
     const headers = new Headers();
     if (init?.headers) {
         if (init.headers instanceof Headers) {
@@ -150,6 +153,11 @@ function buildHeaders(init: RequestInit | undefined, account: OpenWebUIAccount):
     headers.set("authorization", `Bearer ${account.token}`);
     headers.set("accept", headers.get("accept") ?? "application/json");
     headers.set("content-type", headers.get("content-type") ?? "application/json");
+    headers.set("connection", "keep-alive");
+    if (isStreaming) {
+        headers.set("x-litellm-stream-timeout", String(STREAM_TIMEOUT_S));
+        headers.set("x-litellm-timeout", String(STREAM_TIMEOUT_S));
+    }
     return headers;
 }
 
@@ -221,10 +229,29 @@ export function makeOwuiFetch(storage: Storage) {
         }
 
         const url = rewriteUrl(input, account.baseUrl);
-        const headers = buildHeaders(init, account);
         const { init: rewritten } = rewriteBody(init, url.toString());
 
+        const isStreaming = Boolean(
+            rewritten?.body
+            && typeof rewritten.body === "string"
+            && rewritten.body.includes('"stream":true'),
+        );
+        const headers = buildHeaders(init, account, isStreaming);
+
+        const incomingSignal = rewritten?.signal as AbortSignal | undefined;
+        const safetySignal = AbortSignal.timeout(SAFETY_TIMEOUT_MS);
+        const signals: AbortSignal[] = [safetySignal];
+        if (incomingSignal) signals.push(incomingSignal);
+        const combinedSignal = signals.length === 1 ? signals[0] : AbortSignal.any(signals);
+
+        const fetchOpts: RequestInit = {
+            ...rewritten,
+            headers,
+            signal: combinedSignal,
+        };
+
         let lastRes: Response | undefined;
+        let didAuthRetry = false;
         for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
             if (attempt > 0) {
                 const delay = RETRY_BASE_MS * 2 ** (attempt - 1);
@@ -233,11 +260,43 @@ export function makeOwuiFetch(storage: Storage) {
             }
 
             logRequest(url.toString(), init?.method ?? "GET");
-            const res = await fetch(url, { ...rewritten, headers });
+            const res = await fetch(url, fetchOpts);
             logResponse(url.toString(), res.status);
             lastRes = res;
 
             if (res.ok) return res;
+
+            if (AUTH_RETRY_STATUSES.has(res.status) && !didAuthRetry) {
+                didAuthRetry = true;
+                const username = process.env.OWUI_USERNAME;
+                const password = process.env.OWUI_PASSWORD;
+                if (username && password) {
+                    log(`[fetch] got ${res.status} — attempting token refresh`);
+                    await res.text().catch(() => {});
+                    try {
+                        const result = await oidcLogin({
+                            baseUrl: account.baseUrl,
+                            username,
+                            password,
+                            duoPasscode: process.env.OWUI_DUO_PASSCODE,
+                            duoMethod: process.env.OWUI_DUO_PASSCODE ? "passcode" : "push",
+                        });
+                        account = {
+                            ...account,
+                            token: result.token,
+                            expiresAt: result.expiresAt,
+                            updatedAt: Date.now(),
+                        };
+                        storage.upsert(account);
+                        headers.set("authorization", `Bearer ${account.token}`);
+                        log(`[fetch] refreshed token for ${account.name} after ${res.status}`);
+                        attempt--;
+                        continue;
+                    } catch (err) {
+                        log(`[fetch] auth refresh failed: ${err instanceof Error ? err.message : err}`);
+                    }
+                }
+            }
 
             if (RETRY_STATUSES.has(res.status) && attempt < MAX_RETRIES) {
                 try {
