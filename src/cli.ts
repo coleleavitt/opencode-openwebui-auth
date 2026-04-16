@@ -13,13 +13,14 @@ function usage(): never {
     console.log(`opencode-openwebui-auth CLI
 
 Commands:
-  login [baseUrl]           Automated OIDC login (Shibboleth + Duo 2FA)
-  add <baseUrl> <token>     Add/update an OpenWebUI account (manual JWT paste)
-  list                      List configured accounts
-  use <name>                Set the current account
-  remove <name>             Delete an account
-  models [name]             List models for the given (or current) account
-  whoami                    Print the current account and verify token
+  login [baseUrl]                       Automated OIDC login (Shibboleth + Duo 2FA)
+  add <baseUrl> <token>                 Add/update an OpenWebUI account (manual JWT paste)
+  list                                  List configured accounts
+  use <name>                            Set the current account
+  remove <name>                         Delete an account
+  models [name] [--verbose|-v|--json]   List models for the given (or current) account
+  config [name]                         Show OpenWebUI instance config (name, version, features)
+  whoami                                Print the current account and verify token
 
 Env:
   OWUI_BASE_URL             Default base URL (default: https://chat.ai2s.org)
@@ -133,13 +134,68 @@ function cmdRemove(args: string[]): void {
 }
 
 async function cmdModels(args: string[]): Promise<void> {
+    const flags = new Set(args.filter((a) => a.startsWith("-")));
+    const positional = args.filter((a) => !a.startsWith("-"));
+
+    const storage = new Storage();
+    const account = positional[0]
+        ? storage.list().find((a) => a.name === positional[0])
+        : storage.getCurrent();
+    if (!account) throw new Error("No such account");
+
+    const models = await listModels(account.baseUrl, account.token);
+
+    if (flags.has("--json")) {
+        console.log(JSON.stringify(models, null, 2));
+        return;
+    }
+
+    const capFlags = (caps: Record<string, boolean | undefined> | undefined): string => {
+        if (!caps) return "";
+        const flag = (k: string, c: string) => (caps[k] ? c : "·");
+        return [
+            flag("vision", "V"),
+            flag("file_upload", "F"),
+            flag("web_search", "W"),
+            flag("code_interpreter", "C"),
+            flag("builtin_tools", "T"),
+            flag("citations", "Q"),
+            flag("usage", "U"),
+        ].join("");
+    };
+
+    if (flags.has("--verbose") || flags.has("-v")) {
+        console.log("LEGEND: V=vision F=file W=web-search C=code-interp T=tools Q=citations U=usage  (· = off)");
+        console.log();
+        console.log(`${"ID".padEnd(46)}  ${"OWNER".padEnd(10)}  ${"CONN".padEnd(8)}  CAPS     NAME`);
+        console.log("─".repeat(120));
+        for (const m of models.data) {
+            const caps = capFlags(m.info?.meta?.capabilities);
+            const owner = (m.owned_by ?? "?").padEnd(10).slice(0, 10);
+            const conn = (m.connection_type ?? "?").padEnd(8).slice(0, 8);
+            console.log(`${m.id.padEnd(46)}  ${owner}  ${conn}  ${caps}  ${m.name ?? ""}`);
+        }
+        console.log();
+        console.log(`${models.data.length} model(s) accessible to ${account.name}`);
+    } else {
+        for (const m of models.data) {
+            console.log(`${m.id.padEnd(48)}  ${m.name ?? ""}`);
+        }
+    }
+}
+
+async function cmdConfig(args: string[]): Promise<void> {
     const storage = new Storage();
     const account = args[0] ? storage.list().find((a) => a.name === args[0]) : storage.getCurrent();
-    if (!account) throw new Error("No such account");
-    const models = await listModels(account.baseUrl, account.token);
-    for (const m of models.data) {
-        console.log(`${m.id.padEnd(48)}  ${m.name ?? ""}`);
-    }
+    const baseUrl = account?.baseUrl ?? process.env.OWUI_BASE_URL ?? "https://chat.ai2s.org";
+    const cfg = await fetchInstanceConfig(baseUrl);
+    const enabledFeatures = Object.entries(cfg.features ?? {})
+        .filter(([, v]) => v)
+        .map(([k]) => k);
+    console.log(`instance:  ${cfg.name} v${cfg.version}`);
+    console.log(`baseUrl:   ${baseUrl}`);
+    console.log(`status:    ${cfg.status ? "online" : "offline"}`);
+    console.log(`features:  ${enabledFeatures.join(", ") || "(none enabled)"}`);
 }
 
 async function cmdWhoami(): Promise<void> {
@@ -172,6 +228,9 @@ try {
             break;
         case "models":
             await cmdModels(rest);
+            break;
+        case "config":
+            await cmdConfig(rest);
             break;
         case "whoami":
             await cmdWhoami();

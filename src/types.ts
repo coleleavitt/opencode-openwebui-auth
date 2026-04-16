@@ -17,11 +17,45 @@ export interface OpenWebUIStore {
 export interface OpenWebUIModelInfo {
     id: string;
     name?: string;
+    object?: string;
+    created?: number;
+    owned_by?: string;
+    connection_type?: "external" | "internal" | string;
+    urlIdx?: number;
     info?: {
+        id?: string;
+        user_id?: string;
+        base_model_id?: string | null;
+        name?: string;
         meta?: {
-            capabilities?: Record<string, boolean>;
+            description?: string | null;
+            capabilities?: {
+                file_context?: boolean;
+                vision?: boolean;
+                file_upload?: boolean;
+                web_search?: boolean;
+                image_generation?: boolean;
+                code_interpreter?: boolean;
+                citations?: boolean;
+                status_updates?: boolean;
+                usage?: boolean;
+                builtin_tools?: boolean;
+                [key: string]: boolean | undefined;
+            };
+            suggestion_prompts?: string[] | null;
+            tags?: { name: string }[];
+            defaultFeatureIds?: string[];
         };
+        is_active?: boolean;
+        access_control?: unknown;
+        updated_at?: number;
+        created_at?: number;
     };
+    actions?: unknown[];
+    filters?: unknown[];
+    tags?: { name: string }[];
+    arena?: boolean;
+    pipeline?: { type?: string };
 }
 
 export interface OpenWebUIModelsResponse {

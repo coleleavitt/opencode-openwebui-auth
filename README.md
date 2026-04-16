@@ -92,23 +92,63 @@ If your OWUI instance doesn't use Shibboleth, or you want to bypass the flow:
 bun src/cli.ts add https://chat.ai2s.org <paste-jwt-here>
 ```
 
-Or use opencode's built-in prompt (it'll ask for the token):
+### Option 3 — `opencode auth login` (interactive)
+
+The plugin registers itself with opencode's built-in auth UI. Run:
 
 ```bash
 opencode auth login openwebui
 ```
 
+You'll be prompted to choose between:
+
+- **Automated OIDC (Shibboleth + Duo 2FA)** — same flow as `bun src/cli.ts login`,
+  but with interactive prompts for username, password, and Duo method (push or
+  passcode). Env vars (`OWUI_USERNAME`, `OWUI_PASSWORD`, `OWUI_DUO_PASSCODE`)
+  are honored as fallbacks if you press Enter on a prompt.
+- **Paste OpenWebUI JWT manually** — for non-Shibboleth instances. Validates
+  that the input is a 3-segment JWT before saving.
+
 ## Useful commands
 
 ```bash
-bun src/cli.ts login              # automated Shibboleth + Duo OIDC login
-bun src/cli.ts add <url> <jwt>    # manual JWT paste
-bun src/cli.ts list               # list accounts
-bun src/cli.ts use <name>         # switch current
-bun src/cli.ts models             # list models available to your user
-bun src/cli.ts whoami             # verify token
-bun src/cli.ts remove <name>      # delete account
+bun src/cli.ts login                          # automated Shibboleth + Duo OIDC login
+bun src/cli.ts add <url> <jwt>                # manual JWT paste
+bun src/cli.ts list                           # list accounts
+bun src/cli.ts use <name>                     # switch current
+bun src/cli.ts models                         # list models (id + name only)
+bun src/cli.ts models --verbose               # list with owner, connection, capabilities
+bun src/cli.ts models --json                  # full /api/models JSON dump
+bun src/cli.ts config                         # show OWUI instance name/version/features
+bun src/cli.ts whoami                         # verify token + show user identity
+bun src/cli.ts remove <name>                  # delete account
 ```
+
+The `models --verbose` view uses a compact capability bitmap: `V`=vision,
+`F`=file upload, `W`=web search, `C`=code interpreter, `T`=builtin tools,
+`Q`=citations, `U`=usage tracking. A `·` means the capability is off for
+that model. Example:
+
+```
+ID                                    OWNER     CONN      CAPS     NAME
+bedrock-claude-4-6-opus               openai    external  VFWCTQU  Anthropic - Claude Opus 4.6
+openai.gpt-oss-120b-1:0               openai    external  ·FWCTQU  OpenAI - GPT OSS 120B
+```
+
+## Endpoints used
+
+| OWUI endpoint                | Used for                                    |
+| ---------------------------- | ------------------------------------------- |
+| `GET /api/models`              | List all models accessible to the user      |
+| `GET /api/v1/auths/`           | Verify token + fetch user identity (whoami) |
+| `GET /api/config`              | Instance metadata (name, version, features) |
+| `POST /api/chat/completions`   | Chat (rewritten URL from any provider call) |
+| `GET /oauth/oidc/login`        | Initiate the Shibboleth OIDC flow           |
+| `GET /oauth/oidc/callback`     | Receives the JWT cookie after Shib + Duo    |
+<!-- table not formatted: invalid structure -->
+
+These are all the canonical endpoints from `open-webui/backend/open_webui/main.py`
+(`/api/models` is at `main.py:1469`).
 
 ## Auto-refresh
 
