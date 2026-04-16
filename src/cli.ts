@@ -2,6 +2,7 @@
 import { Storage } from "./storage";
 import { fetchInstanceConfig, listModels, normalizeBaseUrl, verifyToken } from "./oauth/api";
 import { parseJwtClaims } from "./oauth/jwt";
+import { oidcLogin } from "./oauth/oidc-login";
 import { getOpencodeAuthPath, removeOpencodeProviderAuth, setOpencodeProviderAuth } from "./opencode-auth";
 import type { OpenWebUIAccount } from "./types";
 
@@ -12,7 +13,8 @@ function usage(): never {
     console.log(`opencode-openwebui-auth CLI
 
 Commands:
-  add <baseUrl> <token>     Add/update an OpenWebUI account
+  login [baseUrl]           Automated OIDC login (Shibboleth + Duo 2FA)
+  add <baseUrl> <token>     Add/update an OpenWebUI account (manual JWT paste)
   list                      List configured accounts
   use <name>                Set the current account
   remove <name>             Delete an account
@@ -20,9 +22,57 @@ Commands:
   whoami                    Print the current account and verify token
 
 Env:
-  OWUI_BASE_URL             Default base URL when not provided
+  OWUI_BASE_URL             Default base URL (default: https://chat.ai2s.org)
+  OWUI_USERNAME             NetID for automated login
+  OWUI_PASSWORD             NetID password for automated login
+  OWUI_DUO_PASSCODE         6-digit Duo Mobile passcode (optional, uses push if not set)
 `);
     process.exit(1);
+}
+
+async function cmdLogin(args: string[]): Promise<void> {
+    const baseUrl = normalizeBaseUrl(args[0] ?? process.env.OWUI_BASE_URL ?? "https://chat.ai2s.org");
+    const username = process.env.OWUI_USERNAME;
+    const password = process.env.OWUI_PASSWORD;
+    const duoPasscode = process.env.OWUI_DUO_PASSCODE;
+
+    if (!username || !password) {
+        throw new Error("Set OWUI_USERNAME and OWUI_PASSWORD environment variables");
+    }
+
+    console.log(`logging in to ${baseUrl} as ${username}...`);
+    const method = duoPasscode ? "passcode" : "push";
+    if (method === "push") {
+        console.log("no OWUI_DUO_PASSCODE set — will send Duo Push (approve on your phone)");
+    }
+
+    const result = await oidcLogin({
+        baseUrl,
+        username,
+        password,
+        duoPasscode,
+        duoMethod: method,
+    });
+
+    const user = await verifyToken(baseUrl, result.token);
+    const cfg = await fetchInstanceConfig(baseUrl).catch(() => null);
+    const name = `${user.email}@${new URL(baseUrl).host}`;
+    const account: OpenWebUIAccount = {
+        name,
+        baseUrl,
+        token: result.token,
+        expiresAt: result.expiresAt,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+    };
+    new Storage().upsert(account);
+    setOpencodeProviderAuth(PROVIDER_ID, DUMMY_KEY);
+    console.log(
+        `\nlogged in as ${user.name} <${user.email}> (${user.role})`,
+    );
+    console.log(`instance: ${cfg?.name ?? "unknown"} v${cfg?.version ?? "?"}`);
+    console.log(`token expires: ${new Date(result.expiresAt).toISOString()}`);
+    console.log(`wrote provider "${PROVIDER_ID}" -> ${getOpencodeAuthPath()}`);
 }
 
 async function cmdAdd(args: string[]): Promise<void> {
@@ -105,6 +155,9 @@ async function cmdWhoami(): Promise<void> {
 const [, , cmd, ...rest] = process.argv;
 try {
     switch (cmd) {
+        case "login":
+            await cmdLogin(rest);
+            break;
         case "add":
             await cmdAdd(rest);
             break;

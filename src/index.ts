@@ -98,7 +98,8 @@ export const OpenWebUIAuthPlugin = async (_input: PluginInput) => {
 
 export default OpenWebUIAuthPlugin;
 
-// Re-exports for tooling
-export { Storage } from "./storage";
-export { listModels } from "./oauth/api";
+// NOTE: Do NOT re-export Storage/classes/functions here — opencode's
+// getLegacyPlugins scans ALL module exports and calls every function it finds
+// as a plugin factory, which crashes on class constructors. CLI tooling
+// should import directly from ./storage etc.
 export type { OpenWebUIAccount } from "./types";

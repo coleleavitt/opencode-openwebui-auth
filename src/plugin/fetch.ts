@@ -1,6 +1,7 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { isTokenExpired } from "../oauth/jwt";
+import { oidcLogin } from "../oauth/oidc-login";
 import { log, logRequest, logResponse } from "../logger";
 import type { Storage } from "../storage";
 import type { OpenWebUIAccount } from "../types";
@@ -169,7 +170,7 @@ export function makeOwuiFetch(storage: Storage) {
         input: string | URL | Request,
         init?: RequestInit,
     ): Promise<Response> {
-        const account = storage.getCurrent();
+        let account = storage.getCurrent();
         if (!account) {
             throw new Error(
                 "No OpenWebUI account configured. Run: opencode auth login openwebui",
@@ -179,10 +180,37 @@ export function makeOwuiFetch(storage: Storage) {
             throw new Error(`Account ${account.name} is disabled`);
         }
         if (isTokenExpired(account.token, 0)) {
-            log(`[fetch] token expired for ${account.name} (exp check)`);
-            throw new Error(
-                `Token for ${account.name} is expired. Re-run: opencode auth login openwebui`,
-            );
+            log(`[fetch] token expired for ${account.name} — attempting auto-refresh`);
+            const username = process.env.OWUI_USERNAME;
+            const password = process.env.OWUI_PASSWORD;
+            if (username && password) {
+                try {
+                    const result = await oidcLogin({
+                        baseUrl: account.baseUrl,
+                        username,
+                        password,
+                        duoPasscode: process.env.OWUI_DUO_PASSCODE,
+                        duoMethod: process.env.OWUI_DUO_PASSCODE ? "passcode" : "push",
+                    });
+                    account = {
+                        ...account,
+                        token: result.token,
+                        expiresAt: result.expiresAt,
+                        updatedAt: Date.now(),
+                    };
+                    storage.upsert(account);
+                    log(`[fetch] auto-refreshed token for ${account.name}, expires ${new Date(result.expiresAt).toISOString()}`);
+                } catch (err) {
+                    log(`[fetch] auto-refresh failed: ${err instanceof Error ? err.message : err}`);
+                    throw new Error(
+                        `Token for ${account.name} is expired and auto-refresh failed. Re-run: bun src/cli.ts login`,
+                    );
+                }
+            } else {
+                throw new Error(
+                    `Token for ${account.name} is expired. Set OWUI_USERNAME+OWUI_PASSWORD for auto-refresh, or re-run: bun src/cli.ts login`,
+                );
+            }
         }
 
         const url = rewriteUrl(input, account.baseUrl);
