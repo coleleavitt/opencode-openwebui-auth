@@ -3,11 +3,7 @@ import { Storage } from "./storage";
 import { fetchInstanceConfig, listModels, normalizeBaseUrl, verifyToken } from "./oauth/api";
 import { parseJwtClaims } from "./oauth/jwt";
 import { oidcLogin } from "./oauth/oidc-login";
-import { getOpencodeAuthPath, removeOpencodeProviderAuth, setOpencodeProviderAuth } from "./opencode-auth";
 import type { OpenWebUIAccount } from "./types";
-
-const PROVIDER_ID = "openwebui";
-const DUMMY_KEY = "owui-plugin-managed";
 
 function usage(): never {
     console.log(`opencode-openwebui-auth CLI
@@ -67,13 +63,11 @@ async function cmdLogin(args: string[]): Promise<void> {
         updatedAt: Date.now(),
     };
     new Storage().upsert(account);
-    setOpencodeProviderAuth(PROVIDER_ID, DUMMY_KEY);
     console.log(
         `\nlogged in as ${user.name} <${user.email}> (${user.role})`,
     );
     console.log(`instance: ${cfg?.name ?? "unknown"} v${cfg?.version ?? "?"}`);
     console.log(`token expires: ${new Date(result.expiresAt).toISOString()}`);
-    console.log(`wrote provider "${PROVIDER_ID}" -> ${getOpencodeAuthPath()}`);
 }
 
 async function cmdAdd(args: string[]): Promise<void> {
@@ -95,11 +89,9 @@ async function cmdAdd(args: string[]): Promise<void> {
         updatedAt: Date.now(),
     };
     new Storage().upsert(account);
-    setOpencodeProviderAuth(PROVIDER_ID, DUMMY_KEY);
     console.log(
         `added ${name}  (instance=${cfg?.name ?? "unknown"} v${cfg?.version ?? "?"}, expires=${new Date(account.expiresAt!).toISOString()})`,
     );
-    console.log(`wrote provider "${PROVIDER_ID}" -> ${getOpencodeAuthPath()}`);
 }
 
 function cmdList(): void {
@@ -127,9 +119,6 @@ function cmdRemove(args: string[]): void {
     const name = args[0];
     if (!name) usage();
     new Storage().remove(name);
-    if (new Storage().list().length === 0) {
-        removeOpencodeProviderAuth(PROVIDER_ID);
-    }
     console.log(`removed ${name}`);
 }
 

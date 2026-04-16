@@ -176,16 +176,6 @@ export const OpenWebUIAuthPlugin = async (_input: PluginInput) => {
                 },
             ],
         },
-        "chat.params": async (
-            input: { provider: { id: string } },
-            output: { options: Record<string, unknown> },
-        ) => {
-            if (input.provider.id !== PROVIDER_ID) return;
-            // @ai-sdk/openai-compatible adds include_usage via its own `includeUsage`
-            // option (set in provider.ts:1264). Do NOT add stream_options here — OWUI
-            // passes it through to LiteLLM → Bedrock which rejects unknown fields,
-            // causing truncated responses or silent failures.
-        },
     };
 };
 
