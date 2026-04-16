@@ -21,8 +21,10 @@ bun run build
 
 ## Configure opencode
 
-Register OpenWebUI as a provider in `~/.config/opencode/opencode.json` so opencode
-knows how to talk to it (OWUI exposes an OpenAI-compatible `/api/chat/completions`):
+The plugin is **near-zero-config**. Just declare the provider exists with one
+empty stub and the plugin auto-fetches your model list, auto-sets the baseURL,
+auto-picks the OpenAI-compatible adapter, and auto-zeroes the costs (the OWUI
+instance owner pays, not you):
 
 ```jsonc
 {
@@ -31,24 +33,72 @@ knows how to talk to it (OWUI exposes an OpenAI-compatible `/api/chat/completion
     "file:///home/you/WebstormProjects/opencode-openwebui-auth/dist/bundle.js"
   ],
   "provider": {
+    "openwebui": {}
+  }
+}
+```
+
+That's it — no `npm`, no `baseURL`, no `models` map. After running
+`opencode auth login openwebui` once, every model your OWUI account can see
+(including new ones added by the admin later) shows up on the next opencode
+start. No config edit required.
+
+### Why is the empty `{}` needed?
+
+opencode resolves providers in this order (from `provider/provider.ts:1001`):
+
+1. Snapshots `cfg.provider` keys into a `configProviders` array
+2. Builds a database from `models.dev` catalog + extends it with `configProviders`
+3. Calls `Plugin.list()` which fires plugin hooks (including ours)
+4. For each plugin with `auth.loader`, looks up `database[providerID]` and
+   passes it to the loader
+
+If `openwebui` isn't in `cfg.provider` at step 1, the database never gets an
+entry, and at step 4 our loader receives `undefined` — so we can't populate
+models. The `"openwebui": {}` stub satisfies step 1 with the absolute minimum
+content; everything else (name, npm, baseURL, models) is left to defaults
+or to our loader.
+
+### Optional overrides
+
+To pin a name, blacklist models, set custom limits, etc., extend the stub.
+Anything you specify takes precedence over what the plugin discovers;
+everything else stays dynamic:
+
+```jsonc
+{
+  "plugin": ["file:///.../bundle.js"],
+  "provider": {
     "openwebui": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "OpenWebUI",
-      "options": {
-        "baseURL": "https://chat.ai2s.org/api"
-      },
+      "name": "Arizona AI Gateway",        // custom display name
+      "blacklist": ["openai.gpt-oss-120b-1:0"],  // hide specific models
       "models": {
-        "bedrock-claude-4-6-opus":       { "name": "Claude Opus 4.6" },
-        "bedrock-claude-4-5-haiku":      { "name": "Claude Haiku 4.5" },
-        "google.gemma-3-12b-it":         { "name": "Gemma 3 12B IT" },
-        "openai.gpt-oss-120b-1:0":       { "name": "GPT-OSS 120B" },
-        "meta.llama4-maverick-17b-instruct-v1:0": { "name": "Llama 4 Maverick 17B" },
-        "bedrock-nova-pro-v1":           { "name": "Amazon Nova Pro" }
+        "bedrock-claude-4-6-opus": {
+          "name": "Claude Opus 4.6 (UA)",   // override discovered name
+          "limit": { "context": 200000, "output": 16384 }
+        }
       }
     }
   }
 }
 ```
+
+### How the dynamic injection works (peek under the hood)
+
+Once the user has authenticated (so `auth.get("openwebui")` resolves),
+opencode invokes our `auth.loader(getAuth, providerInfo)` (registered against
+the `openwebui` provider you declared in opencode.json):
+
+- We fetch `GET /api/models` from the user's OWUI instance with their JWT.
+- For each model, we build a fully-populated `Model` object matching opencode's
+  `provider/provider.ts:777` Zod schema and write it to `provider.models[id]`.
+  Capabilities (vision/files/tools) are derived from OWUI's
+  `info.meta.capabilities` flags.
+- Cost is `0` for every field — the OWUI instance owner is paying upstream.
+- We return `{ baseURL, apiKey, fetch }` and opencode's `mergeProvider()`
+  merges them into `provider.options`.
+- Standard provider resolution takes over: blacklist filtering, variant
+  generation, SDK adapter loading (defaulting to `@ai-sdk/openai-compatible`).
 
 ## Authenticate
 

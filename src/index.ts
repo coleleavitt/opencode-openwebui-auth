@@ -1,15 +1,15 @@
 import type { PluginInput } from "@opencode-ai/plugin";
 import { Storage } from "./storage";
 import { log, logAuth } from "./logger";
-import { fetchInstanceConfig, normalizeBaseUrl, verifyToken } from "./oauth/api";
+import { buildOpencodeModel, fetchInstanceConfig, listModels, normalizeBaseUrl, verifyToken } from "./oauth/api";
 import { parseJwtClaims } from "./oauth/jwt";
 import { oidcLogin } from "./oauth/oidc-login";
 import { makeOwuiFetch } from "./plugin/fetch";
-import type { OpenWebUIAccount } from "./types";
 
 const PROVIDER_ID = "openwebui";
 const DUMMY_KEY = "owui-plugin-managed";
 const DEFAULT_BASE_URL = "https://chat.ai2s.org";
+const DEFAULT_NPM = "@ai-sdk/openai-compatible";
 
 async function persistAccount(
     storage: Storage,
@@ -36,16 +36,45 @@ export const OpenWebUIAuthPlugin = async (_input: PluginInput) => {
     return {
         auth: {
             provider: PROVIDER_ID,
-            async loader(_getAuth: unknown, provider: { models?: Record<string, { cost?: unknown }> }) {
+            async loader(
+                _getAuth: unknown,
+                provider: {
+                    models?: Record<string, Record<string, unknown>>;
+                    options?: Record<string, unknown>;
+                } | undefined,
+            ) {
                 const account = storage.getCurrent();
                 if (!account) {
-                    log("[loader] no account configured");
+                    log("[loader] no account configured — provider will be empty until login");
                     return {};
                 }
-                for (const model of Object.values(provider.models ?? {})) {
-                    model.cost = { input: 0, output: 0, cache: { read: 0, write: 0 } };
+                if (!provider) {
+                    log(`[loader] provider "${PROVIDER_ID}" not declared in opencode.json — add { "provider": { "${PROVIDER_ID}": {} } } to enable dynamic model discovery`);
+                    return { apiKey: DUMMY_KEY, fetch: owuiFetch };
                 }
-                return { apiKey: DUMMY_KEY, fetch: owuiFetch };
+                provider.models ??= {};
+                const npm = (provider.options?.npm as string) ?? DEFAULT_NPM;
+                try {
+                    const { data } = await listModels(account.baseUrl, account.token);
+                    let added = 0;
+                    let preserved = 0;
+                    for (const m of data) {
+                        if (provider.models[m.id]) {
+                            preserved++;
+                            continue;
+                        }
+                        provider.models[m.id] = buildOpencodeModel(PROVIDER_ID, account.baseUrl, npm, m);
+                        added++;
+                    }
+                    log(`[loader] populated ${added} model(s) from ${account.baseUrl}/api/models (${preserved} kept from user config)`);
+                } catch (err) {
+                    log(`[loader] dynamic model discovery failed: ${err instanceof Error ? err.message : err}`);
+                }
+                return {
+                    baseURL: `${account.baseUrl}/api`,
+                    apiKey: DUMMY_KEY,
+                    fetch: owuiFetch,
+                };
             },
             methods: [
                 {
