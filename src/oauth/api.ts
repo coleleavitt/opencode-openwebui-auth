@@ -45,13 +45,41 @@ export async function listModels(baseUrl: string, token: string): Promise<OpenWe
     return (await res.json()) as OpenWebUIModelsResponse;
 }
 
-/**
- * Build an opencode `Model` object from an OWUI `/api/models` entry.
- * Schema verified against opencode/packages/opencode/src/provider/provider.ts:777-846.
- *
- * Defaults are conservative (e.g. context=200K matches Claude/GPT-4 era).
- * Cost is always {0,0,0,0} because the OWUI instance owner pays, not the user.
- */
+type ModelLimits = { context: number; output: number };
+
+// Sourced from LiteLLM v1.81.12 model_prices_and_context_window.json
+// (cloned at ~/VulnerabilityResearch/chat_ai2s_org/litellm/ tag v1.81.12-stable.2).
+// OWUI's /api/models returns context_length: null for all models, so we infer
+// from the model ID/name. Ordered most-specific-first; first match wins.
+const MODEL_LIMITS: [RegExp, ModelLimits][] = [
+    [/claude.*opus.*4[._-]?6/i,      { context: 1000000, output: 128000 }],
+    [/claude.*opus.*4[._-]?5/i,      { context: 200000,  output: 64000 }],
+    [/claude.*opus.*4[._-]?[01]/i,   { context: 200000,  output: 32000 }],
+    [/claude.*haiku.*4[._-]?5/i,     { context: 200000,  output: 64000 }],
+    [/claude.*sonnet.*4[._-]?[56]/i, { context: 200000,  output: 64000 }],
+    [/claude.*sonnet.*4/i,           { context: 200000,  output: 16000 }],
+    [/claude/i,                      { context: 200000,  output: 16000 }],
+    [/gpt.*5/i,                      { context: 1000000, output: 100000 }],
+    [/gpt.*4o/i,                     { context: 128000,  output: 16384 }],
+    [/gpt.*4/i,                      { context: 128000,  output: 8192 }],
+    [/llama.*4.*maverick/i,          { context: 1048576, output: 65536 }],
+    [/llama.*4/i,                    { context: 131072,  output: 16384 }],
+    [/llama.*3/i,                    { context: 131072,  output: 8192 }],
+    [/gemma.*3/i,                    { context: 128000,  output: 8192 }],
+    [/gemini.*2/i,                   { context: 1048576, output: 65536 }],
+    [/nova.*pro/i,                   { context: 300000,  output: 5000 }],
+    [/nova.*lite/i,                  { context: 300000,  output: 5000 }],
+];
+const DEFAULT_LIMITS: ModelLimits = { context: 128000, output: 16384 };
+
+function inferModelLimits(modelId: string, modelName: string): ModelLimits {
+    const haystack = `${modelId} ${modelName}`;
+    for (const [pattern, limits] of MODEL_LIMITS) {
+        if (pattern.test(haystack)) return limits;
+    }
+    return DEFAULT_LIMITS;
+}
+
 export function buildOpencodeModel(
     providerID: string,
     baseUrl: string,
@@ -59,6 +87,7 @@ export function buildOpencodeModel(
     raw: import("../types").OpenWebUIModelInfo,
 ): Record<string, unknown> {
     const caps = raw.info?.meta?.capabilities ?? {};
+    const limits = inferModelLimits(raw.id, raw.name ?? "");
     return {
         id: raw.id,
         providerID,
@@ -69,7 +98,7 @@ export function buildOpencodeModel(
         headers: {},
         options: {},
         cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
-        limit: { context: 200000, output: 8192 },
+        limit: { context: limits.context, output: limits.output },
         capabilities: {
             temperature: true,
             reasoning: false,
