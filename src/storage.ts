@@ -11,6 +11,7 @@ const EMPTY: OpenWebUIStore = { version: 1, accounts: {} };
 
 export class Storage {
     private path: string;
+    private writeChain: Promise<void> = Promise.resolve();
 
     constructor(path: string = STORE_PATH) {
         this.path = path;
@@ -82,37 +83,58 @@ export class Storage {
         return Object.values(this.load().accounts);
     }
 
-    addUsage(
+    async addUsage(
         accountName: string,
         usage: { input: number; output: number; cacheRead: number; cacheWrite: number; model?: string },
-    ): void {
-        const store = this.load();
-        const account = store.accounts[accountName];
-        if (!account) return;
+    ): Promise<void> {
+        const op = this.writeChain.then(() => {
+            const store = this.load();
+            const account = store.accounts[accountName];
+            if (!account) return;
 
-        const today = new Date().toISOString().slice(0, 10);
-        const pricing = getModelPricing(usage.model);
-        const costUsd = computeUsageCost(usage, pricing);
-        const modelKey = normalizeModelKey(usage.model);
+            const today = new Date().toISOString().slice(0, 10);
+            const pricing = getModelPricing(usage.model);
+            const costUsd = computeUsageCost(usage, pricing);
+            const modelKey = normalizeModelKey(usage.model);
 
-        if (!account.dailyUsage || account.dailyUsage.date !== today) {
-            account.dailyUsage = {
-                date: today,
-                inputTokens: 0,
-                outputTokens: 0,
-                cacheReadTokens: 0,
-                cacheWriteTokens: 0,
-                requestCount: 0,
-            };
-        }
-        account.dailyUsage.inputTokens += usage.input;
-        account.dailyUsage.outputTokens += usage.output;
-        account.dailyUsage.cacheReadTokens += usage.cacheRead;
-        account.dailyUsage.cacheWriteTokens += usage.cacheWrite;
-        account.dailyUsage.requestCount += 1;
+            if (!account.dailyUsage || account.dailyUsage.date !== today) {
+                account.dailyUsage = {
+                    date: today,
+                    inputTokens: 0,
+                    outputTokens: 0,
+                    cacheReadTokens: 0,
+                    cacheWriteTokens: 0,
+                    requestCount: 0,
+                };
+            }
+            account.dailyUsage.inputTokens += usage.input;
+            account.dailyUsage.outputTokens += usage.output;
+            account.dailyUsage.cacheReadTokens += usage.cacheRead;
+            account.dailyUsage.cacheWriteTokens += usage.cacheWrite;
+            account.dailyUsage.requestCount += 1;
 
-        if (!account.totalUsage) {
-            account.totalUsage = {
+            if (!account.totalUsage) {
+                account.totalUsage = {
+                    inputTokens: 0,
+                    outputTokens: 0,
+                    cacheReadTokens: 0,
+                    cacheWriteTokens: 0,
+                    requestCount: 0,
+                    costUsd: 0,
+                    firstSeen: today,
+                };
+            }
+            account.totalUsage.inputTokens += usage.input;
+            account.totalUsage.outputTokens += usage.output;
+            account.totalUsage.cacheReadTokens += usage.cacheRead;
+            account.totalUsage.cacheWriteTokens += usage.cacheWrite;
+            account.totalUsage.requestCount += 1;
+            account.totalUsage.costUsd = roundCost(account.totalUsage.costUsd + costUsd);
+
+            if (!account.totalUsage.byModel) {
+                account.totalUsage.byModel = {};
+            }
+            const perModel: PerModelUsage = account.totalUsage.byModel[modelKey] ?? {
                 inputTokens: 0,
                 outputTokens: 0,
                 cacheReadTokens: 0,
@@ -120,38 +142,23 @@ export class Storage {
                 requestCount: 0,
                 costUsd: 0,
                 firstSeen: today,
+                lastSeen: today,
             };
-        }
-        account.totalUsage.inputTokens += usage.input;
-        account.totalUsage.outputTokens += usage.output;
-        account.totalUsage.cacheReadTokens += usage.cacheRead;
-        account.totalUsage.cacheWriteTokens += usage.cacheWrite;
-        account.totalUsage.requestCount += 1;
-        account.totalUsage.costUsd = roundCost(account.totalUsage.costUsd + costUsd);
+            perModel.inputTokens += usage.input;
+            perModel.outputTokens += usage.output;
+            perModel.cacheReadTokens += usage.cacheRead;
+            perModel.cacheWriteTokens += usage.cacheWrite;
+            perModel.requestCount += 1;
+            perModel.costUsd = roundCost(perModel.costUsd + costUsd);
+            perModel.lastSeen = today;
+            account.totalUsage.byModel[modelKey] = perModel;
 
-        if (!account.totalUsage.byModel) {
-            account.totalUsage.byModel = {};
-        }
-        const perModel: PerModelUsage = account.totalUsage.byModel[modelKey] ?? {
-            inputTokens: 0,
-            outputTokens: 0,
-            cacheReadTokens: 0,
-            cacheWriteTokens: 0,
-            requestCount: 0,
-            costUsd: 0,
-            firstSeen: today,
-            lastSeen: today,
-        };
-        perModel.inputTokens += usage.input;
-        perModel.outputTokens += usage.output;
-        perModel.cacheReadTokens += usage.cacheRead;
-        perModel.cacheWriteTokens += usage.cacheWrite;
-        perModel.requestCount += 1;
-        perModel.costUsd = roundCost(perModel.costUsd + costUsd);
-        perModel.lastSeen = today;
-        account.totalUsage.byModel[modelKey] = perModel;
-
-        this.save(store);
+            this.save(store);
+        }).catch((e) => {
+            log(`[storage] addUsage failed: ${e instanceof Error ? e.message : e}`);
+        });
+        this.writeChain = op;
+        return op;
     }
 }
 

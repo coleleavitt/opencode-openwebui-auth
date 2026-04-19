@@ -194,13 +194,36 @@ function interceptUsage(
     if (!res.body) return res;
 
     const [userStream, usageStream] = res.body.tee();
+    const abortController = new AbortController();
+
+    const wrappedUserStream = new ReadableStream({
+        async start(controller) {
+            const reader = userStream.getReader();
+            try {
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    controller.enqueue(value);
+                }
+                controller.close();
+            } catch (e) {
+                controller.error(e);
+            } finally {
+                reader.releaseLock();
+            }
+        },
+        cancel() {
+            abortController.abort();
+        },
+    });
 
     (async () => {
+        const reader = usageStream.getReader();
         try {
-            const reader = usageStream.getReader();
             const decoder = new TextDecoder();
             let buffer = "";
             while (true) {
+                if (abortController.signal.aborted) break;
                 const { done, value } = await reader.read();
                 if (done) break;
                 buffer += decoder.decode(value, { stream: true });
@@ -209,7 +232,6 @@ function interceptUsage(
                 }
             }
 
-            // OpenAI SSE: usage in last chunk as {"usage":{"prompt_tokens":N,"completion_tokens":N,...}}
             const usageMatches = [
                 ...buffer.matchAll(/"usage"\s*:\s*\{[^}]*"completion_tokens"\s*:\s*(\d+)[^}]*\}/g),
             ];
@@ -226,7 +248,7 @@ function interceptUsage(
 
                 log(`[usage] ${accountName} model=${modelId ?? "unknown"}: in=${input} out=${output} cache_read=${cacheRead}`);
 
-                storage.addUsage(accountName, {
+                await storage.addUsage(accountName, {
                     input,
                     output,
                     cacheRead,
@@ -236,10 +258,13 @@ function interceptUsage(
             }
         } catch {
             // Usage tracking is best-effort
+        } finally {
+            reader.releaseLock();
+            try { await usageStream.cancel(); } catch {}
         }
-    })();
+    })().catch((e) => log(`[usage-extract] failed: ${e?.message ?? e}`));
 
-    return new Response(userStream, {
+    return new Response(wrappedUserStream, {
         status: res.status,
         statusText: res.statusText,
         headers: res.headers,
