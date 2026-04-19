@@ -1,3 +1,14 @@
+export interface PerModelUsage {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheWriteTokens: number;
+    requestCount: number;
+    costUsd: number;
+    firstSeen: string;
+    lastSeen: string;
+}
+
 export interface OpenWebUIAccount {
     name: string;
     baseUrl: string;
@@ -6,6 +17,26 @@ export interface OpenWebUIAccount {
     createdAt: number;
     updatedAt: number;
     disabled?: boolean;
+
+    dailyUsage?: {
+        date: string;
+        inputTokens: number;
+        outputTokens: number;
+        cacheReadTokens: number;
+        cacheWriteTokens: number;
+        requestCount: number;
+    };
+
+    totalUsage?: {
+        inputTokens: number;
+        outputTokens: number;
+        cacheReadTokens: number;
+        cacheWriteTokens: number;
+        requestCount: number;
+        costUsd: number;
+        firstSeen: string;
+        byModel?: Record<string, PerModelUsage>;
+    };
 }
 
 export interface OpenWebUIStore {

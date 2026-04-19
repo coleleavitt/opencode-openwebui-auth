@@ -112,6 +112,11 @@ function rewriteBody(
     }
     const original = JSON.parse(JSON.stringify(parsed));
     const scrubbed = scrubBedrockToolFields(parsed);
+
+    const obj = scrubbed as Record<string, unknown>;
+    if (obj.stream === true) {
+        obj.stream_options = { ...(obj.stream_options as Record<string, unknown> || {}), include_usage: true };
+    }
     if (VERBOSE_BODY_LOG) {
         bodyLog(join(BODY_LOG_DIR, "requests.log"), { url, original, scrubbed });
     }
@@ -180,6 +185,67 @@ function rewriteUrl(input: string | URL | Request, baseUrl: string): URL {
     return target;
 }
 
+function interceptUsage(
+    res: Response,
+    storage: Storage,
+    accountName: string,
+    modelId: string | undefined,
+): Response {
+    if (!res.body) return res;
+
+    const [userStream, usageStream] = res.body.tee();
+
+    (async () => {
+        try {
+            const reader = usageStream.getReader();
+            const decoder = new TextDecoder();
+            let buffer = "";
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                if (buffer.length > 4096) {
+                    buffer = buffer.slice(-4096);
+                }
+            }
+
+            // OpenAI SSE: usage in last chunk as {"usage":{"prompt_tokens":N,"completion_tokens":N,...}}
+            const usageMatches = [
+                ...buffer.matchAll(/"usage"\s*:\s*\{[^}]*"completion_tokens"\s*:\s*(\d+)[^}]*\}/g),
+            ];
+            const usageMatch = usageMatches.length > 0 ? usageMatches[usageMatches.length - 1] : null;
+            if (usageMatch) {
+                const block = usageMatch[0];
+                const promptMatch = block.match(/"prompt_tokens"\s*:\s*(\d+)/);
+                const completionMatch = block.match(/"completion_tokens"\s*:\s*(\d+)/);
+                const cachedMatch = block.match(/"cached_tokens"\s*:\s*(\d+)/);
+
+                const input = promptMatch ? parseInt(promptMatch[1], 10) : 0;
+                const output = completionMatch ? parseInt(completionMatch[1], 10) : 0;
+                const cacheRead = cachedMatch ? parseInt(cachedMatch[1], 10) : 0;
+
+                log(`[usage] ${accountName} model=${modelId ?? "unknown"}: in=${input} out=${output} cache_read=${cacheRead}`);
+
+                storage.addUsage(accountName, {
+                    input,
+                    output,
+                    cacheRead,
+                    cacheWrite: 0,
+                    model: modelId,
+                });
+            }
+        } catch {
+            // Usage tracking is best-effort
+        }
+    })();
+
+    return new Response(userStream, {
+        status: res.status,
+        statusText: res.statusText,
+        headers: res.headers,
+    });
+}
+
 export function makeOwuiFetch(storage: Storage) {
     return async function owuiFetch(
         input: string | URL | Request,
@@ -229,7 +295,15 @@ export function makeOwuiFetch(storage: Storage) {
         }
 
         const url = rewriteUrl(input, account.baseUrl);
-        const { init: rewritten } = rewriteBody(init, url.toString());
+        const { init: rewritten, rewritten: parsedBody } = rewriteBody(init, url.toString());
+
+        const isChatCompletions = url.pathname.includes("/chat/completions");
+        const accountForUsage = account.name;
+        let requestModelId: string | undefined;
+        if (parsedBody && typeof parsedBody === "object") {
+            const m = (parsedBody as Record<string, unknown>).model;
+            if (typeof m === "string") requestModelId = m;
+        }
 
         const isStreaming = Boolean(
             rewritten?.body
@@ -264,7 +338,12 @@ export function makeOwuiFetch(storage: Storage) {
             logResponse(url.toString(), res.status);
             lastRes = res;
 
-            if (res.ok) return res;
+            if (res.ok) {
+                if (isChatCompletions && res.body && accountForUsage) {
+                    return interceptUsage(res, storage, accountForUsage, requestModelId);
+                }
+                return res;
+            }
 
             if (AUTH_RETRY_STATUSES.has(res.status) && !didAuthRetry) {
                 didAuthRetry = true;

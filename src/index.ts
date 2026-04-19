@@ -181,4 +181,5 @@ export const OpenWebUIAuthPlugin = async (_input: PluginInput) => {
 
 export default OpenWebUIAuthPlugin;
 
-export type { OpenWebUIAccount } from "./types";
+export type { OpenWebUIAccount, PerModelUsage } from "./types";
+export { getCombinedTotalUsage } from "./storage";

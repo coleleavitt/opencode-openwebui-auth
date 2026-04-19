@@ -1,8 +1,9 @@
 import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
-import type { OpenWebUIAccount, OpenWebUIStore } from "./types";
+import type { OpenWebUIAccount, OpenWebUIStore, PerModelUsage } from "./types";
 import { log } from "./logger";
+import { computeUsageCost, getModelPricing, normalizeModelKey } from "./pricing";
 
 const STORE_PATH = join(homedir(), ".config", "opencode", "openwebui-accounts.json");
 
@@ -80,4 +81,131 @@ export class Storage {
     list(): OpenWebUIAccount[] {
         return Object.values(this.load().accounts);
     }
+
+    addUsage(
+        accountName: string,
+        usage: { input: number; output: number; cacheRead: number; cacheWrite: number; model?: string },
+    ): void {
+        const store = this.load();
+        const account = store.accounts[accountName];
+        if (!account) return;
+
+        const today = new Date().toISOString().slice(0, 10);
+        const pricing = getModelPricing(usage.model);
+        const costUsd = computeUsageCost(usage, pricing);
+        const modelKey = normalizeModelKey(usage.model);
+
+        if (!account.dailyUsage || account.dailyUsage.date !== today) {
+            account.dailyUsage = {
+                date: today,
+                inputTokens: 0,
+                outputTokens: 0,
+                cacheReadTokens: 0,
+                cacheWriteTokens: 0,
+                requestCount: 0,
+            };
+        }
+        account.dailyUsage.inputTokens += usage.input;
+        account.dailyUsage.outputTokens += usage.output;
+        account.dailyUsage.cacheReadTokens += usage.cacheRead;
+        account.dailyUsage.cacheWriteTokens += usage.cacheWrite;
+        account.dailyUsage.requestCount += 1;
+
+        if (!account.totalUsage) {
+            account.totalUsage = {
+                inputTokens: 0,
+                outputTokens: 0,
+                cacheReadTokens: 0,
+                cacheWriteTokens: 0,
+                requestCount: 0,
+                costUsd: 0,
+                firstSeen: today,
+            };
+        }
+        account.totalUsage.inputTokens += usage.input;
+        account.totalUsage.outputTokens += usage.output;
+        account.totalUsage.cacheReadTokens += usage.cacheRead;
+        account.totalUsage.cacheWriteTokens += usage.cacheWrite;
+        account.totalUsage.requestCount += 1;
+        account.totalUsage.costUsd = roundCost(account.totalUsage.costUsd + costUsd);
+
+        if (!account.totalUsage.byModel) {
+            account.totalUsage.byModel = {};
+        }
+        const perModel: PerModelUsage = account.totalUsage.byModel[modelKey] ?? {
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheWriteTokens: 0,
+            requestCount: 0,
+            costUsd: 0,
+            firstSeen: today,
+            lastSeen: today,
+        };
+        perModel.inputTokens += usage.input;
+        perModel.outputTokens += usage.output;
+        perModel.cacheReadTokens += usage.cacheRead;
+        perModel.cacheWriteTokens += usage.cacheWrite;
+        perModel.requestCount += 1;
+        perModel.costUsd = roundCost(perModel.costUsd + costUsd);
+        perModel.lastSeen = today;
+        account.totalUsage.byModel[modelKey] = perModel;
+
+        this.save(store);
+    }
+}
+
+function roundCost(value: number): number {
+    return Math.round(value * 1e6) / 1e6;
+}
+
+export function getCombinedTotalUsage(accounts: OpenWebUIAccount[]): {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheWriteTokens: number;
+    requestCount: number;
+    costUsd: number;
+    byModel: Record<string, PerModelUsage>;
+} {
+    const combined = {
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        requestCount: 0,
+        costUsd: 0,
+        byModel: {} as Record<string, PerModelUsage>,
+    };
+
+    for (const account of accounts) {
+        const t = account.totalUsage;
+        if (!t) continue;
+        combined.inputTokens += t.inputTokens;
+        combined.outputTokens += t.outputTokens;
+        combined.cacheReadTokens += t.cacheReadTokens;
+        combined.cacheWriteTokens += t.cacheWriteTokens;
+        combined.requestCount += t.requestCount;
+        combined.costUsd = roundCost(combined.costUsd + t.costUsd);
+
+        if (t.byModel) {
+            for (const [key, pm] of Object.entries(t.byModel)) {
+                const existing = combined.byModel[key];
+                if (existing) {
+                    existing.inputTokens += pm.inputTokens;
+                    existing.outputTokens += pm.outputTokens;
+                    existing.cacheReadTokens += pm.cacheReadTokens;
+                    existing.cacheWriteTokens += pm.cacheWriteTokens;
+                    existing.requestCount += pm.requestCount;
+                    existing.costUsd = roundCost(existing.costUsd + pm.costUsd);
+                    if (pm.firstSeen < existing.firstSeen) existing.firstSeen = pm.firstSeen;
+                    if (pm.lastSeen > existing.lastSeen) existing.lastSeen = pm.lastSeen;
+                } else {
+                    combined.byModel[key] = { ...pm };
+                }
+            }
+        }
+    }
+
+    return combined;
 }
