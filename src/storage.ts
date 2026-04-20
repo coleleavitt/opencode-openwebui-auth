@@ -17,6 +17,15 @@ export class Storage {
         this.path = path;
     }
 
+    private enqueueWrite<T>(fn: () => T): Promise<T> {
+        const next = this.writeChain.then(() => fn()).catch((e) => {
+            log(`[storage] write error: ${e instanceof Error ? e.message : e}`);
+            throw e;
+        });
+        this.writeChain = next.then(() => {}, () => {});
+        return next;
+    }
+
     load(): OpenWebUIStore {
         try {
             if (!existsSync(this.path)) return { ...EMPTY, accounts: {} };
@@ -45,29 +54,35 @@ export class Storage {
         }
     }
 
-    upsert(account: OpenWebUIAccount): void {
-        const store = this.load();
-        store.accounts[account.name] = account;
-        if (!store.current) store.current = account.name;
-        this.save(store);
+    async upsert(account: OpenWebUIAccount): Promise<void> {
+        return this.enqueueWrite(() => {
+            const store = this.load();
+            store.accounts[account.name] = account;
+            if (!store.current) store.current = account.name;
+            this.save(store);
+        });
     }
 
-    remove(name: string): void {
-        const store = this.load();
-        delete store.accounts[name];
-        if (store.current === name) {
-            const first = Object.keys(store.accounts)[0];
-            store.current = first;
-        }
-        this.save(store);
+    async remove(name: string): Promise<void> {
+        return this.enqueueWrite(() => {
+            const store = this.load();
+            delete store.accounts[name];
+            if (store.current === name) {
+                const first = Object.keys(store.accounts)[0];
+                store.current = first;
+            }
+            this.save(store);
+        });
     }
 
-    setCurrent(name: string): boolean {
-        const store = this.load();
-        if (!store.accounts[name]) return false;
-        store.current = name;
-        this.save(store);
-        return true;
+    async setCurrent(name: string): Promise<boolean> {
+        return this.enqueueWrite(() => {
+            const store = this.load();
+            if (!store.accounts[name]) return false;
+            store.current = name;
+            this.save(store);
+            return true;
+        });
     }
 
     getCurrent(): OpenWebUIAccount | undefined {
@@ -87,7 +102,7 @@ export class Storage {
         accountName: string,
         usage: { input: number; output: number; cacheRead: number; cacheWrite: number; model?: string },
     ): Promise<void> {
-        const op = this.writeChain.then(() => {
+        return this.enqueueWrite(() => {
             const store = this.load();
             const account = store.accounts[accountName];
             if (!account) return;
@@ -154,11 +169,7 @@ export class Storage {
             account.totalUsage.byModel[modelKey] = perModel;
 
             this.save(store);
-        }).catch((e) => {
-            log(`[storage] addUsage failed: ${e instanceof Error ? e.message : e}`);
         });
-        this.writeChain = op;
-        return op;
     }
 }
 

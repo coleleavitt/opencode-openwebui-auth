@@ -21,7 +21,7 @@ async function persistAccount(
     const user = await verifyToken(baseUrl, token);
     const cfg = await fetchInstanceConfig(baseUrl).catch(() => null);
     const name = `${user.email}@${new URL(baseUrl).host}`;
-    storage.upsert({
+    await storage.upsert({
         name, baseUrl, token, expiresAt,
         createdAt: Date.now(),
         updatedAt: Date.now(),

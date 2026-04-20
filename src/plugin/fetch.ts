@@ -1,23 +1,26 @@
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { homedir } from "node:os";
 import { isTokenExpired } from "../oauth/jwt";
 import { oidcLogin } from "../oauth/oidc-login";
 import { log, logRequest, logResponse } from "../logger";
 import type { Storage } from "../storage";
 import type { OpenWebUIAccount } from "../types";
 
-const BODY_LOG_DIR = "/tmp/opencode-openwebui-auth";
+const BODY_LOG_DIR = join(homedir(), ".config", "opencode", "openwebui-auth", "logs");
 const RES_LOG = join(BODY_LOG_DIR, "responses.log");
 const SUMMARY_LOG = join(BODY_LOG_DIR, "summary.log");
 try {
-    mkdirSync(BODY_LOG_DIR, { recursive: true });
+    mkdirSync(BODY_LOG_DIR, { recursive: true, mode: 0o700 });
 } catch {}
 
 const VERBOSE_BODY_LOG = process.env.OPENWEBUI_AUTH_DEBUG === "verbose";
 
 function bodyLog(path: string, entry: Record<string, unknown>): void {
     try {
+        const isNew = !existsSync(path);
         appendFileSync(path, `${JSON.stringify({ ts: new Date().toISOString(), ...entry })}\n`);
+        if (isNew) chmodSync(path, 0o600);
     } catch {}
 }
 
@@ -304,7 +307,7 @@ export function makeOwuiFetch(storage: Storage) {
                         expiresAt: result.expiresAt,
                         updatedAt: Date.now(),
                     };
-                    storage.upsert(account);
+                    await storage.upsert(account);
                     log(`[fetch] auto-refreshed token for ${account.name}, expires ${new Date(result.expiresAt).toISOString()}`);
                 } catch (err) {
                     log(`[fetch] auto-refresh failed: ${err instanceof Error ? err.message : err}`);
@@ -391,7 +394,7 @@ export function makeOwuiFetch(storage: Storage) {
                             expiresAt: result.expiresAt,
                             updatedAt: Date.now(),
                         };
-                        storage.upsert(account);
+                        await storage.upsert(account);
                         headers.set("authorization", `Bearer ${account.token}`);
                         log(`[fetch] refreshed token for ${account.name} after ${res.status}`);
                         attempt--;
