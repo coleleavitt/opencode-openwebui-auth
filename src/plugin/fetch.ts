@@ -53,7 +53,6 @@ const RETRYABLE_BODY_PATTERNS = [
 ];
 const STREAM_TIMEOUT_S = 600;
 const SAFETY_TIMEOUT_MS = 10 * 60 * 1000;
-const STREAM_READ_TIMEOUT_MS = 300_000;
 
 const OWUI_SENSITIVE_HEADERS = new Set([
     "x-api-key",
@@ -325,22 +324,6 @@ function rewriteUrl(input: string | URL | Request, baseUrl: string): URL {
     return target;
 }
 
-function readWithTimeout(
-    reader: { read(): Promise<{ done: boolean; value?: unknown }> },
-    ms: number,
-): Promise<{ done: boolean; value?: unknown }> {
-    let timer: ReturnType<typeof setTimeout>;
-    return Promise.race([
-        reader.read(),
-        new Promise<never>((_, reject) => {
-            timer = setTimeout(
-                () => reject(new Error("stream read timed out")),
-                ms,
-            );
-        }),
-    ]).finally(() => clearTimeout(timer));
-}
-
 function interceptUsage(
     res: Response,
     storage: Storage,
@@ -356,10 +339,7 @@ function interceptUsage(
     const wrappedUserStream = new ReadableStream({
         async pull(controller) {
             try {
-                const { done, value } = await readWithTimeout(
-                    userReader,
-                    STREAM_READ_TIMEOUT_MS,
-                );
+                const { done, value } = await userReader.read();
                 if (done) {
                     controller.close();
                 } else {
@@ -382,10 +362,7 @@ function interceptUsage(
             let buffer = "";
             while (true) {
                 if (abortController.signal.aborted) break;
-                const { done, value } = await readWithTimeout(
-                    reader,
-                    STREAM_READ_TIMEOUT_MS,
-                );
+                const { done, value } = await reader.read();
                 if (done) break;
                 buffer += decoder.decode(
                     value as Uint8Array | undefined,
