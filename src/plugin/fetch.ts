@@ -37,6 +37,20 @@ const RETRY_STATUSES = new Set([502, 503, 504]);
 const AUTH_RETRY_STATUSES = new Set([401, 403]);
 const MAX_RETRIES = 2;
 const RETRY_BASE_MS = 1500;
+
+// LiteLLM v1.81–1.84+ misclassifies Bedrock's serviceUnavailableException as
+// HTTP 400 (BadRequestError) instead of 503. The Bedrock event stream decoder
+// uses the HTTP status from the binary event frame (always 400 for streaming
+// errors) rather than mapping :exception-type to the correct semantic code.
+// We detect these by inspecting the response body for known Bedrock transient
+// error signatures and retry them as if they were 503s.
+const RETRYABLE_BODY_PATTERNS = [
+    "serviceUnavailableException",
+    "Bedrock is unable to process your request",
+    "MidStreamFallbackError",
+    "modelTimeoutException",
+    "modelStreamErrorException",
+];
 const STREAM_TIMEOUT_S = 600;
 const SAFETY_TIMEOUT_MS = 10 * 60 * 1000;
 
@@ -577,6 +591,46 @@ export function makeOwuiFetch(storage: Storage) {
                     });
                 } catch {}
                 continue;
+            }
+
+            // Detect Bedrock transient errors misclassified as 400 by LiteLLM.
+            // See RETRYABLE_BODY_PATTERNS for details on the upstream bug.
+            if (
+                res.status === 400 &&
+                attempt < MAX_RETRIES &&
+                isChatCompletions
+            ) {
+                try {
+                    const text = await res.text();
+                    const isRetryable = RETRYABLE_BODY_PATTERNS.some((p) =>
+                        text.includes(p),
+                    );
+                    if (isRetryable) {
+                        log(
+                            `[fetch] detected misclassified Bedrock 503 as 400 — retrying (attempt ${attempt})`,
+                        );
+                        bodyLog(RES_LOG, {
+                            url: url.toString(),
+                            status: res.status,
+                            body: text.slice(0, 500),
+                            retryable: true,
+                            attempt,
+                        });
+                        continue;
+                    }
+                    // Not retryable — reconstruct since body was consumed
+                    const rebuilt = new Response(text, {
+                        status: res.status,
+                        statusText: res.statusText,
+                        headers: res.headers,
+                    });
+                    bodyLog(RES_LOG, {
+                        url: url.toString(),
+                        status: res.status,
+                        body: text.slice(0, 2000),
+                    });
+                    return rebuilt;
+                } catch {}
             }
 
             if (!res.ok) {
