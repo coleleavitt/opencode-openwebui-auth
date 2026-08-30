@@ -106,9 +106,16 @@ function convertTools(tools: Tool[]): Array<Record<string, unknown>> {
     }));
 }
 
-/** pi reasoning level -> OpenAI reasoning_effort (OWUI forwards it upstream). */
+// pi reasoning level -> OpenAI reasoning_effort.
+//
+// DISABLED by default: this OWUI/LiteLLM+Bedrock deployment translates
+// reasoning_effort into a Bedrock `thinking` param, which most models here reject
+// ("Unknown parameter: 'thinking'" — gpt-5.6, claude-haiku, gemma). Models still
+// reason natively without it. Opt back in per-request only when a model is known
+// to accept it, gated by OWUI_SEND_REASONING_EFFORT=1.
 function reasoningEffort(level: string | undefined): string | undefined {
     if (!level) return undefined;
+    if (process.env.OWUI_SEND_REASONING_EFFORT !== "1") return undefined;
     const map: Record<string, string> = {
         minimal: "minimal",
         low: "low",

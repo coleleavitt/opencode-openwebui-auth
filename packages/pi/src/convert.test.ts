@@ -92,7 +92,7 @@ describe("buildOpenAIRequest", () => {
         });
     });
 
-    it("declares tools and passes reasoning_effort for reasoning models", () => {
+    it("declares tools and omits reasoning_effort by default (OWUI/Bedrock rejects it)", () => {
         const req = buildOpenAIRequest(
             "m",
             ctx({
@@ -111,7 +111,29 @@ describe("buildOpenAIRequest", () => {
             type: "function",
             function: { name: "read" },
         });
-        expect(req.reasoning_effort).toBe("high");
+        // Off unless OWUI_SEND_REASONING_EFFORT=1 — the deployment turns it into a
+        // Bedrock `thinking` param that most models reject.
+        expect(req.reasoning_effort).toBeUndefined();
+    });
+
+    it("sends reasoning_effort only when OWUI_SEND_REASONING_EFFORT=1", () => {
+        const prev = process.env.OWUI_SEND_REASONING_EFFORT;
+        process.env.OWUI_SEND_REASONING_EFFORT = "1";
+        try {
+            const req = buildOpenAIRequest(
+                "m",
+                ctx({
+                    messages: [
+                        { role: "user", content: "x", timestamp: 0 } as never,
+                    ],
+                }),
+                { reasoning: "high", supportsReasoning: true },
+            );
+            expect(req.reasoning_effort).toBe("high");
+        } finally {
+            if (prev === undefined) delete process.env.OWUI_SEND_REASONING_EFFORT;
+            else process.env.OWUI_SEND_REASONING_EFFORT = prev;
+        }
     });
 
     it("sanitizes blank user content to a placeholder (Bedrock-safe)", () => {
