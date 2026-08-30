@@ -16,6 +16,8 @@ import type {
 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
+import { streamOpenWebUI } from "./stream";
+
 /**
  * pi extension: register OpenWebUI as an OpenAI-compatible provider whose auth
  * is a University-of-Arizona Shibboleth+Duo OIDC login. The OWUI JWT is the
@@ -185,5 +187,9 @@ export default async function openWebUiPiAuth(pi: ExtensionAPI) {
             refreshToken: refreshOpenWebUIToken,
             getApiKey: (credentials) => credentials.access,
         },
+        // Custom transport: OWUI -> LiteLLM -> Bedrock request shaping, retry
+        // (429/Retry-After, 5xx, LiteLLM-mislabeled 400), OIDC re-auth, SSE
+        // parsing, and usage accounting. Mirrors the opencode fetch shim.
+        streamSimple: streamOpenWebUI,
     });
 }

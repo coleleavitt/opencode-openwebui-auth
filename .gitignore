@@ -3,3 +3,11 @@ dist/
 *.tgz
 .env
 .env.*
+
+# The global ~/.gitignore_global has a bare `core` rule (for coredumps) that
+# otherwise swallows the entire packages/core/ workspace. Un-ignore the package,
+# then re-ignore its build output and deps so they stay out of git.
+!packages/core/
+!packages/core/**
+packages/core/dist/
+packages/core/node_modules/

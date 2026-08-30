@@ -13,7 +13,7 @@
     "build:opencode": "bun run --cwd packages/opencode build",
     "build:pi": "bun run --cwd packages/pi build",
     "typecheck": "bun run --cwd packages/core typecheck && bun run --cwd packages/opencode typecheck && bun run --cwd packages/pi typecheck",
-    "test": "bun run --cwd packages/core test && bun run --cwd packages/opencode test",
+    "test": "bun run --cwd packages/core test && bun run --cwd packages/opencode test && bun run --cwd packages/pi test",
     "lint": "biome check packages/*/src",
     "lint:fix": "biome check --write packages/*/src",
     "format": "biome format --write packages/*/src",

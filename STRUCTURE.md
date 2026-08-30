@@ -17,6 +17,9 @@ openwebui-auth/
     │       ├── logger.ts       # log/logAuth/logRequest/logResponse
     │       ├── pricing.ts      # per-model cost inference + accounting
     │       ├── storage.ts      # Storage: JSON account store + usage
+    │       ├── request-shaping.ts  # Bedrock-safe body: sanitize*/scrubBedrockToolFields
+    │       ├── retry-policy.ts      # retry statuses, Retry-After, backoff, refresh skew
+    │       ├── usage-parse.ts       # parseUsageFromBuffer (OpenAI SSE usage)
     │       └── oauth/
     │           ├── api.ts          # fetchInstanceConfig/verifyToken/listModels
     │           │                   # + inferModelLimits/buildClaudeVariants
@@ -34,8 +37,9 @@ openwebui-auth/
     │
     └── pi/                 # @openwebui-auth/pi  (bun build -> index.js, pi externalized)
         └── src/
-            └── index.ts        # registerProvider("openwebui", openai-compatible)
-                                # + loginOpenWebUI / refreshOpenWebUIToken
+            ├── index.ts        # registerProvider("openwebui", ...) + login/refresh
+            ├── convert.ts      # pi Context -> Bedrock-safe OpenAI chat request
+            └── stream.ts       # streamSimple: fetch+retry+OIDC re-auth+SSE->pi events+usage
 
 Dependency direction (never reversed):
     opencode ─▶ core ◀─ pi
@@ -45,5 +49,7 @@ Dependency direction (never reversed):
 - `core` has no host-framework imports, so the same audited OIDC/Duo login,
   account store, and pricing serve every adapter.
 - Adapters only translate `core` types into their host's provider contract:
-  opencode's `Model` schema + fetch plugin, pi's `registerProvider` config.
+  opencode's `Model` schema + fetch plugin, pi's `registerProvider` config + a
+  custom `streamSimple`. The Bedrock request-shaping, retry policy, and usage
+  parsing are shared in `core`, so both adapters behave identically upstream.
 - Adding a new host = one new `packages/<host>` adapter depending on `core`.

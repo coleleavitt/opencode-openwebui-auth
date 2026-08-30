@@ -8,6 +8,11 @@ through University-of-Arizona Shibboleth + Duo OIDC (via `@openwebui-auth/core`)
 - The OWUI JWT is used as the bearer key; "refresh" re-runs OIDC since OWUI issues
   no refresh token.
 - Models are discovered live from `/api/models`.
+- A custom `streamSimple` shapes requests for OWUI → LiteLLM → Bedrock (blank-text
+  sanitizing, tool-field scrubbing), retries 429/5xx and LiteLLM-mislabeled 400s,
+  re-authenticates on 401/403, parses the OpenAI SSE stream into pi events, and
+  accounts token usage — the same behavior as the opencode fetch shim, shared via
+  `@openwebui-auth/core`.
 
 ## Install
 ```jsonc

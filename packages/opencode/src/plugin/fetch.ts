@@ -6,8 +6,20 @@ import {
     log,
     logRequest,
     logResponse,
+    AUTH_RETRY_STATUSES,
+    MAX_RETRIES,
+    MAX_RETRY_AFTER_MS,
     oidcLogin,
     type OpenWebUIAccount,
+    parseRetryAfterMs,
+    parseUsageFromBuffer,
+    RATE_LIMIT_STATUS,
+    refreshSkewMs,
+    RETRY_BASE_MS,
+    RETRY_STATUSES,
+    RETRYABLE_BODY_PATTERNS,
+    sanitizeBedrockContent,
+    scrubBedrockToolFields,
     type Storage,
 } from "@openwebui-auth/core";
 
@@ -37,57 +49,8 @@ function bodyLog(path: string, entry: Record<string, unknown>): void {
     } catch {}
 }
 
-// 529 = Anthropic "overloaded" — explicitly retryable per v138 CLI.
-const RETRY_STATUSES = new Set([502, 503, 504, 529]);
-// 429 = rate limited. This OWUI instance runs an active rate_limit_inlet_filter,
-// and upstream (Anthropic/Bedrock) also emit 429 with a Retry-After hint. Handle
-// it separately so we can honor Retry-After instead of the generic backoff.
-const RATE_LIMIT_STATUS = 429;
-const AUTH_RETRY_STATUSES = new Set([401, 403]);
-const MAX_RETRIES = 2;
-const RETRY_BASE_MS = 1500;
-// Refresh the session token this long BEFORE it actually expires, so a long
-// streaming request started near the boundary doesn't die mid-flight. The OWUI
-// token is a fixed ~28-day window (not sliding) and there is no refresh_token, so
-// renewal means a full OIDC re-login — worth doing proactively, not mid-request.
-// Override with OWUI_REFRESH_SKEW_MS.
-const DEFAULT_REFRESH_SKEW_MS = 10 * 60_000; // 10 minutes
-function refreshSkewMs(): number {
-    const raw = Number(process.env.OWUI_REFRESH_SKEW_MS);
-    return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_REFRESH_SKEW_MS;
-}
-// Cap how long we will wait on a Retry-After before giving up, so a hostile or
-// buggy header (e.g. "Retry-After: 3600") can't stall a request indefinitely.
-const MAX_RETRY_AFTER_MS = 30_000;
-
-/**
- * Parse an HTTP Retry-After header into milliseconds.
- * Supports both the delta-seconds form ("120") and the HTTP-date form
- * ("Wed, 21 Oct 2026 07:28:00 GMT"). Returns undefined if absent/unparseable.
- */
-export function parseRetryAfterMs(res: Response): number | undefined {
-    const raw = res.headers.get("retry-after");
-    if (!raw) return undefined;
-    const secs = Number(raw);
-    if (Number.isFinite(secs)) return Math.max(0, secs * 1000);
-    const when = Date.parse(raw);
-    if (Number.isFinite(when)) return Math.max(0, when - Date.now());
-    return undefined;
-}
-
-// LiteLLM v1.81–1.84+ misclassifies Bedrock's serviceUnavailableException as
-// HTTP 400 (BadRequestError) instead of 503. The Bedrock event stream decoder
-// uses the HTTP status from the binary event frame (always 400 for streaming
-// errors) rather than mapping :exception-type to the correct semantic code.
-// We detect these by inspecting the response body for known Bedrock transient
-// error signatures and retry them as if they were 503s.
-const RETRYABLE_BODY_PATTERNS = [
-    "serviceUnavailableException",
-    "Bedrock is unable to process your request",
-    "MidStreamFallbackError",
-    "modelTimeoutException",
-    "modelStreamErrorException",
-];
+// Retry policy, Retry-After parsing, and Bedrock-mislabel detection are shared
+// with the pi adapter — see @openwebui-auth/core/retry-policy.
 const STREAM_TIMEOUT_S = 600;
 const SAFETY_TIMEOUT_MS = 10 * 60 * 1000;
 
@@ -106,147 +69,14 @@ const DUMMY_TOOL = {
     },
 };
 
-function messagesReferenceTools(messages: unknown): boolean {
-    if (!Array.isArray(messages)) return false;
-    for (const msg of messages) {
-        if (!msg || typeof msg !== "object") continue;
-        const m = msg as Record<string, unknown>;
-        if (m.role === "tool") return true;
-        if (Array.isArray(m.tool_calls) && m.tool_calls.length > 0) return true;
-        if (m.tool_call_id) return true;
-    }
-    return false;
-}
-
-// Bedrock rejects ContentBlock entries with blank/whitespace-only text. Two
-// observed error variants:
-//   "The text field in the ContentBlock object at messages.N.content.M is blank."
-//   "messages: text content blocks must contain non-whitespace text"
-// The second variant rejects ANY whitespace-only string, so the placeholder
-// MUST contain at least one non-whitespace character — a single space is NOT
-// enough. Assistant turns with only tool_calls (content=null) are still valid
-// and we leave them alone.
-const BLANK_TEXT_PLACEHOLDER = ".";
-
-export function sanitizeContentBlock(block: unknown): unknown {
-    if (!block || typeof block !== "object") return block;
-    const b = block as Record<string, unknown>;
-
-    // Anthropic-native `tool_result` blocks wrap a nested content array. The
-    // top-level pass would skip past these without sanitizing the text blocks
-    // inside, so recurse explicitly.
-    if (b.type === "tool_result" && Array.isArray(b.content)) {
-        const inner = (b.content as unknown[]).map(sanitizeContentBlock);
-        return {
-            ...b,
-            content:
-                inner.length === 0
-                    ? [{ type: "text", text: BLANK_TEXT_PLACEHOLDER }]
-                    : inner,
-        };
-    }
-
-    if (
-        b.type === "text" &&
-        (typeof b.text !== "string" || b.text.trim() === "")
-    ) {
-        return { ...b, text: BLANK_TEXT_PLACEHOLDER };
-    }
-    return b;
-}
-
-export function sanitizeMessageContent(message: unknown): void {
-    if (!message || typeof message !== "object") return;
-    const m = message as Record<string, unknown>;
-    const content = m.content;
-
-    if (typeof content === "string") {
-        if (content.trim() === "") m.content = BLANK_TEXT_PLACEHOLDER;
-        return;
-    }
-
-    if (Array.isArray(content)) {
-        const sanitized = content.map(sanitizeContentBlock);
-        m.content =
-            sanitized.length === 0
-                ? [{ type: "text", text: BLANK_TEXT_PLACEHOLDER }]
-                : sanitized;
-        return;
-    }
-
-    // content === null / undefined is valid for assistant turns that have only
-    // tool_calls; Bedrock accepts those. Anything else (numbers, booleans, …)
-    // is malformed by the caller and not our problem to coerce.
-}
-
-export function sanitizeBedrockContent(body: unknown): void {
-    if (!body || typeof body !== "object") return;
-    const obj = body as Record<string, unknown>;
-
-    // `system` may be a plain string or an Anthropic-style ContentBlock[]. The
-    // array form was previously skipped — empty text blocks inside it would
-    // bypass sanitation and reach Bedrock unchanged.
-    if (Array.isArray(obj.system)) {
-        const inner = (obj.system as unknown[]).map(sanitizeContentBlock);
-        obj.system =
-            inner.length === 0
-                ? [{ type: "text", text: BLANK_TEXT_PLACEHOLDER }]
-                : inner;
-    } else if (typeof obj.system === "string" && obj.system.trim() === "") {
-        obj.system = BLANK_TEXT_PLACEHOLDER;
-    }
-
-    const messages = obj.messages;
-    if (Array.isArray(messages)) {
-        for (const msg of messages) sanitizeMessageContent(msg);
-    }
-}
-
-function scrubBedrockToolFields(body: unknown): unknown {
-    if (!body || typeof body !== "object") return body;
-    const obj = body as Record<string, unknown>;
-    const tools = obj.tools;
-    const hasTools = Array.isArray(tools) && tools.length > 0;
-
-    if (!hasTools) {
-        if ("tools" in obj) delete obj.tools;
-        if ("tool_choice" in obj) delete obj.tool_choice;
-        if ("parallel_tool_calls" in obj) delete obj.parallel_tool_calls;
-
-        // LiteLLM+Bedrock also rejects if the *conversation history* contains
-        // tool calls or tool-role messages, even when the request declares no
-        // tools. Equivalent of litellm_settings::modify_params=True: inject a
-        // dummy tool so validation passes. The model never calls it.
-        if (messagesReferenceTools(obj.messages)) {
-            obj.tools = [DUMMY_TOOL];
-        }
-    } else {
-        const choice = obj.tool_choice;
-        const choiceType =
-            typeof choice === "object" && choice !== null
-                ? (choice as { type?: string }).type
-                : typeof choice === "string"
-                  ? choice
-                  : undefined;
-
-        if (choiceType === "none") {
-            // Bedrock does not support tool_choice:"none" — drop tools for
-            // this turn so the model just generates free text.
-            delete obj.tools;
-            delete obj.tool_choice;
-            delete obj.parallel_tool_calls;
-        } else if (choiceType === "any" || choiceType === "required") {
-            // Bedrock supports "auto" and specific tool choice; coerce
-            // "any"/"required" to "auto" (closest semantic equivalent).
-            obj.tool_choice = "auto";
-        }
-    }
-
-    // Old-style OpenAI function-calling API — Bedrock chokes on these
-    if ("functions" in obj) delete obj.functions;
-    if ("function_call" in obj) delete obj.function_call;
-    return obj;
-}
+// Bedrock request-shaping and Retry-After parsing live in core; re-exported here
+// so existing imports and tests that reference them via ./fetch keep working.
+export {
+    parseRetryAfterMs,
+    sanitizeBedrockContent,
+    sanitizeContentBlock,
+    sanitizeMessageContent,
+} from "@openwebui-auth/core";
 
 function rewriteBody(
     init: RequestInit | undefined,
@@ -406,40 +236,13 @@ function interceptUsage(
                 }
             }
 
-            const usageMatches = [
-                ...buffer.matchAll(
-                    /"usage"\s*:\s*\{[^}]*"completion_tokens"\s*:\s*(\d+)[^}]*\}/g,
-                ),
-            ];
-            const usageMatch =
-                usageMatches.length > 0
-                    ? usageMatches[usageMatches.length - 1]
-                    : null;
-            if (usageMatch) {
-                const block = usageMatch[0];
-                const promptMatch = block.match(/"prompt_tokens"\s*:\s*(\d+)/);
-                const completionMatch = block.match(
-                    /"completion_tokens"\s*:\s*(\d+)/,
-                );
-                const cachedMatch = block.match(/"cached_tokens"\s*:\s*(\d+)/);
-
-                const input = promptMatch ? parseInt(promptMatch[1], 10) : 0;
-                const output = completionMatch
-                    ? parseInt(completionMatch[1], 10)
-                    : 0;
-                const cacheRead = cachedMatch
-                    ? parseInt(cachedMatch[1], 10)
-                    : 0;
-
+            const usage = parseUsageFromBuffer(buffer);
+            if (usage) {
                 log(
-                    `[usage] ${accountName} model=${modelId ?? "unknown"}: in=${input} out=${output} cache_read=${cacheRead}`,
+                    `[usage] ${accountName} model=${modelId ?? "unknown"}: in=${usage.input} out=${usage.output} cache_read=${usage.cacheRead}`,
                 );
-
                 await storage.addUsage(accountName, {
-                    input,
-                    output,
-                    cacheRead,
-                    cacheWrite: 0,
+                    ...usage,
                     model: modelId,
                 });
             }

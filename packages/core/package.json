@@ -1,0 +1,26 @@
+{
+  "name": "@openwebui-auth/core",
+  "version": "0.0.1",
+  "type": "module",
+  "description": "Shared OpenWebUI OIDC auth, account storage, pricing, and API client",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "typecheck": "tsc",
+    "test": "bun test src",
+    "prepublishOnly": "bun run build"
+  },
+  "dependencies": {}
+}
