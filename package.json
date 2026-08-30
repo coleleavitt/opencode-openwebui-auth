@@ -11,13 +11,15 @@
         "dev": "tsc --watch --noEmit",
         "lint": "biome check src/",
         "lint:fix": "biome check --write src/",
-        "format": "biome format --write src/"
+        "format": "biome format --write src/",
+        "prepare": "lefthook install"
     },
     "devDependencies": {
         "@biomejs/biome": "^2.3.14",
         "@opencode-ai/plugin": "^0.4.45",
         "@types/bun": "^1.2.10",
         "@types/node": "^20.0.0",
+        "lefthook": "^2.1.12",
         "typescript": "^5.3.0"
     },
     "dependencies": {}

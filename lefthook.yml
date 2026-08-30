@@ -1,0 +1,30 @@
+# lefthook.yml — git hooks for opencode-openwebui-auth
+# Install once with:  lefthook install
+# Runtime: bun (the project's toolchain). Biome for lint/format, tsc for types.
+
+pre-commit:
+  parallel: true
+  commands:
+    # Format + apply SAFE fixes to STAGED source files only, then re-stage.
+    # Scoped to staged files so it never mass-reformats untouched code, and
+    # never blocks a commit on pre-existing style in files you didn't touch.
+    biome:
+      glob: "src/**/*.{ts,tsx,js,jsx,json}"
+      run: bunx biome check --write --no-errors-on-unmatched {staged_files}
+      stage_fixed: true
+    # Hard gate: the project must still typecheck. Fast, whole-project.
+    typecheck:
+      run: bun run build:typecheck
+      fail_text: "type errors — fix before committing"
+
+pre-push:
+  parallel: false
+  commands:
+    # Full build (typecheck + bundle) must pass before code leaves the machine.
+    build:
+      run: bun run build
+      fail_text: "build failed — not pushing"
+    # Run the test suite (bun test is a no-op if nothing matches).
+    test:
+      run: bun test
+      fail_text: "tests failed — fix before pushing"
