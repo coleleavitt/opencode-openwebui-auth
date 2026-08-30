@@ -69,28 +69,57 @@ export type ModelLimits = { context: number; output: number };
 
 // Model limits sourced from Anthropic v2.1.137 CLI (sAH() function) + LiteLLM
 // v1.81.12 model_prices_and_context_window.json. Ordered most-specific-first.
+// Limits reconciled from the LiteLLM catalog (model_prices_and_context_window.json)
+// AND live probing of this OWUI/LiteLLM+Bedrock deployment. Where the catalog's
+// stale bedrock entry disagreed with the deployment (e.g. llama4-maverick), the
+// live-verified value wins. Ordered most-specific-first; first match wins.
+//
+// IMPORTANT: Claude 5 / 4.6 (opus + sonnet) are 1M context / 128K output here —
+// NOT 200K. Matching them to a bare /claude/ = 200K made the agent compact far
+// too early (a 1M-window Opus 5 session was compacting at ~180K).
 const MODEL_LIMITS: [RegExp, ModelLimits][] = [
     [/claude.*mythos/i, { context: 1000000, output: 128000 }],
-    [/claude.*opus.*4[._-]?7/i, { context: 1000000, output: 128000 }],
-    [/claude.*opus.*4[._-]?6/i, { context: 1000000, output: 128000 }],
+    // Claude 5 (opus + sonnet): 1M ctx / 128K out (verified live 900K ok, 1.05M fail).
+    [/claude.*(opus|sonnet).*5/i, { context: 1000000, output: 128000 }],
+    [/claude.*5.*(opus|sonnet)/i, { context: 1000000, output: 128000 }],
+    // Claude 4.7 / 4.6 opus + sonnet: 1M ctx / 128K out (catalog + live). The id
+    // may order the name either way (claude-opus-4-6 or claude-4-6-opus), so match
+    // "4-6/4-7" plus "opus|sonnet" in any order.
+    [
+        /claude.*4[._-]?[67].*(opus|sonnet)/i,
+        { context: 1000000, output: 128000 },
+    ],
+    [
+        /claude.*(opus|sonnet).*4[._-]?[67]/i,
+        { context: 1000000, output: 128000 },
+    ],
+    // Older opus 4.5/4.x: 200K.
     [/claude.*opus.*4[._-]?5/i, { context: 200000, output: 64000 }],
     [/claude.*opus.*4[._-]?[01]/i, { context: 200000, output: 32000 }],
-    [/claude.*haiku.*4[._-]?5/i, { context: 200000, output: 64000 }],
-    // sonnet-4-6 default output is 32K per v138 sAH() — not 64K.
-    // 128K output requires the output-128k-2025-02-19 beta header.
-    [/claude.*sonnet.*4[._-]?6/i, { context: 200000, output: 32000 }],
+    // Haiku 4.5: 200K ctx / 64K out (verified live 200K ok, 210K fail). Id may
+    // order either way (claude-haiku-4-5 or claude-4-5-haiku).
+    [
+        /claude.*haiku.*4[._-]?5|claude.*4[._-]?5.*haiku/i,
+        { context: 200000, output: 64000 },
+    ],
     [/claude.*sonnet.*4[._-]?5/i, { context: 200000, output: 64000 }],
     [/claude.*sonnet.*4/i, { context: 200000, output: 16000 }],
     [/claude/i, { context: 200000, output: 16000 }],
+    // gpt-5.6 (sol/luna/terra): catalog advertises 1.05M ctx / 128K out.
+    [/gpt.?5\.6/i, { context: 1050000, output: 128000 }],
+    // gpt-oss-120b: 128K ctx / 128K out (catalog + live).
+    [/gpt.?oss/i, { context: 128000, output: 128000 }],
     [/gpt.*5/i, { context: 1000000, output: 100000 }],
     [/gpt.*4o/i, { context: 128000, output: 16384 }],
     [/gpt.*4/i, { context: 128000, output: 8192 }],
-    [/llama.*4.*maverick/i, { context: 1048576, output: 65536 }],
+    // llama4-maverick on this deployment accepts 1M live (catalog bedrock entry
+    // is stale at 128K).
+    [/llama.*4.*maverick/i, { context: 1000000, output: 8192 }],
     [/llama.*4/i, { context: 131072, output: 16384 }],
     [/llama.*3/i, { context: 131072, output: 8192 }],
-    [/gemma.*3/i, { context: 128000, output: 8192 }],
+    [/gemma.*3/i, { context: 128000, output: 131072 }],
     [/gemini.*2/i, { context: 1048576, output: 65536 }],
-    [/nova.*pro/i, { context: 300000, output: 5000 }],
+    [/nova.*pro/i, { context: 300000, output: 10000 }],
     [/nova.*lite/i, { context: 300000, output: 5000 }],
 ];
 const DEFAULT_LIMITS: ModelLimits = { context: 128000, output: 16384 };

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import {
     backoffDelayMs,
+    inferModelLimits,
     isRetryableErrorBody,
     MAX_RETRY_AFTER_MS,
     messagesReferenceTools,
@@ -149,5 +150,36 @@ describe("parseUsageFromBuffer", () => {
     });
     it("returns undefined without a usage block", () => {
         expect(parseUsageFromBuffer("data: {}")).toBeUndefined();
+    });
+});
+
+describe("inferModelLimits (OWUI/LiteLLM+Bedrock, verified live + catalog)", () => {
+    const cases: [string, number, number][] = [
+        // id, contextWindow, output — the values that stop premature compaction.
+        ["bedrock-claude-5-opus", 1_000_000, 128_000],
+        ["bedrock-claude-5-sonnet", 1_000_000, 128_000],
+        ["bedrock-claude-4-6-opus", 1_000_000, 128_000],
+        ["bedrock-claude-4-6-sonnet", 1_000_000, 128_000],
+        ["bedrock-claude-4-5-haiku", 200_000, 64_000],
+        ["bedrock-nova-pro-v1", 300_000, 10_000],
+        ["openai.gpt-5.6-sol", 1_050_000, 128_000],
+        ["openai.gpt-5.6-luna", 1_050_000, 128_000],
+        ["openai.gpt-oss-120b-1:0", 128_000, 128_000],
+        ["google.gemma-3-12b-it", 128_000, 131_072],
+        ["meta.llama4-maverick-17b-instruct-v1:0", 1_000_000, 8_192],
+    ];
+    for (const [id, context, output] of cases) {
+        it(`${id} -> ${context.toLocaleString()} / ${output.toLocaleString()}`, () => {
+            const limits = inferModelLimits(id, "");
+            expect(limits.context).toBe(context);
+            expect(limits.output).toBe(output);
+        });
+    }
+
+    it("does not collapse Claude 5/4.6 to the 200K /claude/ fallback", () => {
+        // Regression: bare /claude/ = 200K made a 1M Opus 5 compact at ~180K.
+        expect(inferModelLimits("bedrock-claude-5-opus", "").context).toBeGreaterThan(
+            200_000,
+        );
     });
 });
