@@ -13,7 +13,13 @@
  *   6. GET  /oauth/oidc/callback           → Open WebUI exchanges code for JWT
  */
 
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import {
+    existsSync,
+    mkdirSync,
+    readFileSync,
+    renameSync,
+    writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { log } from "../logger";
@@ -23,20 +29,20 @@ import { log } from "../logger";
 /* ------------------------------------------------------------------ */
 
 export interface OidcLoginOptions {
-    baseUrl: string;                          // e.g. "https://chat.ai2s.org"
-    username: string;                         // NetID
-    password: string;                         // NetID password
-    duoPasscode?: string;                     // 6-digit Duo Mobile passcode (skip push)
-    duoMethod?: "push" | "passcode";          // default: passcode if duoPasscode set, else push
-    pollIntervalMs?: number;                  // default: 2000
-    pollTimeoutMs?: number;                   // default: 60000
+    baseUrl: string; // e.g. "https://chat.ai2s.org"
+    username: string; // NetID
+    password: string; // NetID password
+    duoPasscode?: string; // 6-digit Duo Mobile passcode (skip push)
+    duoMethod?: "push" | "passcode"; // default: passcode if duoPasscode set, else push
+    pollIntervalMs?: number; // default: 2000
+    pollTimeoutMs?: number; // default: 60000
 }
 
 export interface OidcLoginResult {
-    token: string;                            // HS256 JWT from Open WebUI
-    oauthIdToken: string;                     // RS256 id_token from Shibboleth
-    oauthSessionId: string;                   // session UUID
-    expiresAt: number;                        // unix ms from JWT exp claim
+    token: string; // HS256 JWT from Open WebUI
+    oauthIdToken: string; // RS256 id_token from Shibboleth
+    oauthSessionId: string; // session UUID
+    expiresAt: number; // unix ms from JWT exp claim
 }
 
 /* ------------------------------------------------------------------ */
@@ -92,7 +98,9 @@ class CookieJar {
         return out;
     }
 
-    static deserialize(data: Record<string, Record<string, string>>): CookieJar {
+    static deserialize(
+        data: Record<string, Record<string, string>>,
+    ): CookieJar {
         const jar = new CookieJar();
         for (const [domain, cookies] of Object.entries(data)) {
             jar.cookies.set(domain, new Map(Object.entries(cookies)));
@@ -105,20 +113,41 @@ class CookieJar {
 /*  HTTP helpers                                                       */
 /* ------------------------------------------------------------------ */
 
-const COOKIE_JAR_PATH = join(homedir(), ".config", "opencode", "openwebui-cookies.json");
+const COOKIE_JAR_PATH = join(
+    homedir(),
+    ".config",
+    "opencode",
+    "openwebui-cookies.json",
+);
 
 function saveCookieJar(jar: CookieJar): void {
     try {
         mkdirSync(dirname(COOKIE_JAR_PATH), { recursive: true });
-        const data = JSON.stringify({ v: 1, ts: Date.now(), cookies: jar.serialize() });
+        const data = JSON.stringify({
+            v: 1,
+            ts: Date.now(),
+            cookies: jar.serialize(),
+        });
         const tmp = `${COOKIE_JAR_PATH}.tmp-${process.pid}`;
         writeFileSync(tmp, data, { mode: 0o600 });
         renameSync(tmp, COOKIE_JAR_PATH);
         log("[oidc] Saved cookie jar for session reuse");
     } catch (err) {
-        log(`[oidc] Failed to save cookie jar: ${err instanceof Error ? err.message : err}`);
+        log(
+            `[oidc] Failed to save cookie jar: ${err instanceof Error ? err.message : err}`,
+        );
     }
 }
+
+// Short-lived cookies (Shibboleth SSO session, OWUI token, AWS ALB) go stale in
+// hours-to-days. The Duo *device-trust* cookies, however, are valid ~400 days and
+// are what let a re-login SKIP the Duo push ("remember this device"). So we age the
+// jar in two tiers: after SHORT_TTL we drop everything EXCEPT the duosecurity.com
+// trust cookies, which we keep until LONG_TTL. This preserves 2FA device trust across
+// monthly re-logins even though the Shibboleth session itself has expired.
+const JAR_SHORT_TTL_MS = 24 * 60 * 60 * 1000; // full-session reuse window
+const JAR_LONG_TTL_MS = 365 * 24 * 60 * 60 * 1000; // Duo device-trust window
+const DUO_TRUST_DOMAIN_RE = /(^|\.)duosecurity\.com$/i;
 
 function loadCookieJar(): CookieJar | null {
     try {
@@ -126,19 +155,43 @@ function loadCookieJar(): CookieJar | null {
         const raw = JSON.parse(readFileSync(COOKIE_JAR_PATH, "utf8"));
         if (raw.v !== 1 || !raw.cookies) return null;
         const ageMs = Date.now() - (raw.ts ?? 0);
-        if (ageMs > 24 * 60 * 60 * 1000) {
-            log("[oidc] Persisted cookie jar older than 24h — ignoring");
+
+        if (ageMs > JAR_LONG_TTL_MS) {
+            log("[oidc] Persisted cookie jar older than 365d — ignoring");
             return null;
         }
+
+        if (ageMs > JAR_SHORT_TTL_MS) {
+            // Keep only Duo device-trust cookies so the push can still be skipped.
+            const trimmed: Record<string, Record<string, string>> = {};
+            for (const [domain, cookies] of Object.entries(
+                raw.cookies as Record<string, Record<string, string>>,
+            )) {
+                if (DUO_TRUST_DOMAIN_RE.test(domain)) trimmed[domain] = cookies;
+            }
+            if (Object.keys(trimmed).length === 0) {
+                log("[oidc] Jar >24h and no Duo trust cookies — ignoring");
+                return null;
+            }
+            log(
+                `[oidc] Jar >24h — keeping only Duo device-trust cookies ` +
+                    `(age=${Math.round(ageMs / 3600000)}h)`,
+            );
+            return CookieJar.deserialize(trimmed);
+        }
+
         const jar = CookieJar.deserialize(raw.cookies);
-        log(`[oidc] Loaded persisted cookie jar (age=${Math.round(ageMs / 60000)}min)`);
+        log(
+            `[oidc] Loaded persisted cookie jar (age=${Math.round(ageMs / 60000)}min)`,
+        );
         return jar;
     } catch {
         return null;
     }
 }
 
-const UA = "Mozilla/5.0 (X11; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0";
+const UA =
+    "Mozilla/5.0 (X11; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0";
 
 async function request(
     jar: CookieJar,
@@ -174,7 +227,11 @@ async function request(
 async function followRedirects(
     jar: CookieJar,
     url: string,
-    opts: { method?: string; body?: string; headers?: Record<string, string> } = {},
+    opts: {
+        method?: string;
+        body?: string;
+        headers?: Record<string, string>;
+    } = {},
     maxHops = 10,
 ): Promise<{ res: Response; url: string; body: string }> {
     let currentUrl = url;
@@ -182,7 +239,14 @@ async function followRedirects(
 
     for (let i = 0; i < maxHops; i++) {
         const location = res.headers.get("location");
-        if (!location || (res.status !== 301 && res.status !== 302 && res.status !== 303 && res.status !== 307 && res.status !== 308)) {
+        if (
+            !location ||
+            (res.status !== 301 &&
+                res.status !== 302 &&
+                res.status !== 303 &&
+                res.status !== 307 &&
+                res.status !== 308)
+        ) {
             break;
         }
         // Consume the body so the connection is freed
@@ -191,7 +255,10 @@ async function followRedirects(
         // Resolve relative redirects
         currentUrl = new URL(location, currentUrl).toString();
         // 303 always becomes GET; 301/302 typically do too for browsers
-        const method = res.status === 307 || res.status === 308 ? (opts.method ?? "GET") : "GET";
+        const method =
+            res.status === 307 || res.status === 308
+                ? (opts.method ?? "GET")
+                : "GET";
         res = await request(jar, currentUrl, { method, redirect: "manual" });
     }
 
@@ -219,7 +286,8 @@ function extractHiddenFields(html: string): Record<string, string> {
         const nameMatch = m[0].match(/name="([^"]+)"/);
         const valueMatch = m[0].match(/value="([^"]*)"/);
         if (nameMatch) {
-            fields[nameMatch[1]] = valueMatch?.[1]?.replace(/&amp;/g, "&") ?? "";
+            fields[nameMatch[1]] =
+                valueMatch?.[1]?.replace(/&amp;/g, "&") ?? "";
         }
     }
     return fields;
@@ -233,11 +301,22 @@ function extractHiddenFields(html: string): Record<string, string> {
  * Step 1: Initiate OIDC login — GET /oauth/oidc/login
  * Returns the Shibboleth authorize URL we got redirected to.
  */
-async function step1_initiateOidc(jar: CookieJar, baseUrl: string): Promise<string> {
+async function step1_initiateOidc(
+    jar: CookieJar,
+    baseUrl: string,
+): Promise<string> {
     log("[oidc] Step 1: Initiating OIDC login");
-    const { res, url: finalUrl } = await followRedirects(jar, `${baseUrl}/oauth/oidc/login`);
-    if (!finalUrl.includes("shibboleth.arizona.edu") && !finalUrl.includes("webauth.arizona.edu")) {
-        throw new Error(`Step 1: Expected redirect to Shibboleth, got ${finalUrl}`);
+    const { res, url: finalUrl } = await followRedirects(
+        jar,
+        `${baseUrl}/oauth/oidc/login`,
+    );
+    if (
+        !finalUrl.includes("shibboleth.arizona.edu") &&
+        !finalUrl.includes("webauth.arizona.edu")
+    ) {
+        throw new Error(
+            `Step 1: Expected redirect to Shibboleth, got ${finalUrl}`,
+        );
     }
     log(`[oidc] Step 1: Landed on ${finalUrl}`);
     return finalUrl;
@@ -257,16 +336,21 @@ async function step2_submitCredentials(
     password: string,
 ): Promise<{ url: string; body: string; skippedCredentials: boolean }> {
     log("[oidc] Step 2a: Fetching localStorage probe (e1s1)");
-    const { body: probeHtml, url: probeUrl } = await followRedirects(jar, shibUrl);
+    const { body: probeHtml, url: probeUrl } = await followRedirects(
+        jar,
+        shibUrl,
+    );
 
     const probeAction = extractFormAction(probeHtml, probeUrl);
-    if (!probeAction) throw new Error("Step 2a: Could not find e1s1 form action");
+    if (!probeAction)
+        throw new Error("Step 2a: Could not find e1s1 form action");
 
     const probeFields = extractHiddenFields(probeHtml);
     probeFields["shib_idp_ls_supported"] = "true";
     probeFields["shib_idp_ls_success.shib_idp_session_ss"] = "true";
     probeFields["shib_idp_ls_success.shib_idp_persistent_ss"] = "true";
-    if (!("_eventId_proceed" in probeFields)) probeFields["_eventId_proceed"] = "";
+    if (!("_eventId_proceed" in probeFields))
+        probeFields["_eventId_proceed"] = "";
 
     log(`[oidc] Step 2a: Submitting localStorage probe → ${probeAction}`);
     const probeRes = await followRedirects(jar, probeAction, {
@@ -279,11 +363,21 @@ async function step2_submitCredentials(
 
     // If Shibboleth session is still alive, it skips the login form entirely
     // and redirects straight to the Duo handoff or the OIDC callback.
-    if (!loginHtml.includes("j_username") || !loginHtml.includes("j_password")) {
-        if (loginUrl.includes("Duo") || loginUrl.includes("duo")
-            || loginUrl.includes("execution=e1s3") || loginUrl.includes("oauth/oidc/callback")
-            || loginHtml.includes("duo_form") || loginHtml.includes("duosecurity.com")) {
-            log("[oidc] Step 2: Shibboleth session alive — skipping credential submission");
+    if (
+        !loginHtml.includes("j_username") ||
+        !loginHtml.includes("j_password")
+    ) {
+        if (
+            loginUrl.includes("Duo") ||
+            loginUrl.includes("duo") ||
+            loginUrl.includes("execution=e1s3") ||
+            loginUrl.includes("oauth/oidc/callback") ||
+            loginHtml.includes("duo_form") ||
+            loginHtml.includes("duosecurity.com")
+        ) {
+            log(
+                "[oidc] Step 2: Shibboleth session alive — skipping credential submission",
+            );
             return { url: loginUrl, body: loginHtml, skippedCredentials: true };
         }
         throw new Error(
@@ -292,7 +386,8 @@ async function step2_submitCredentials(
     }
 
     const loginAction = extractFormAction(loginHtml, loginUrl);
-    if (!loginAction) throw new Error("Step 2b: Could not find e1s2 login form action");
+    if (!loginAction)
+        throw new Error("Step 2b: Could not find e1s2 login form action");
 
     log(`[oidc] Step 2b: Submitting credentials → ${loginAction}`);
     const loginFields: Record<string, string> = {
@@ -307,9 +402,12 @@ async function step2_submitCredentials(
     });
     log(`[oidc] Step 2b: After credential submit → ${afterLogin}`);
 
-    const bouncedBack = afterLogin.includes("execution=e1s2") && body.includes("j_password");
-    const hasErrorMsg = body.includes("credentials you provided cannot be determined to be authentic")
-        || body.includes("login-error");
+    const bouncedBack =
+        afterLogin.includes("execution=e1s2") && body.includes("j_password");
+    const hasErrorMsg =
+        body.includes(
+            "credentials you provided cannot be determined to be authentic",
+        ) || body.includes("login-error");
     if (bouncedBack || hasErrorMsg) {
         throw new Error("Step 2b: Login failed — invalid NetID or password");
     }
@@ -327,19 +425,29 @@ async function step3_navigateToDuo(
     jar: CookieJar,
     currentUrl: string,
     currentBody: string,
-): Promise<{ duoAuthorizeUrl: string; duoBody: string; shibConversationUrl: string }> {
+): Promise<{
+    duoAuthorizeUrl: string;
+    duoBody: string;
+    shibConversationUrl: string;
+}> {
     log("[oidc] Step 3: Navigating to Duo 2FA");
 
     let url = currentUrl;
     let body = currentBody;
 
     for (let i = 0; i < 8; i++) {
-        if (body.includes("duosecurity.com") || url.includes("duosecurity.com")) break;
+        if (body.includes("duosecurity.com") || url.includes("duosecurity.com"))
+            break;
 
         // Look for the Duo authorize path in the current page FIRST (before auto-advancing)
-        const duoAuthPath = body.match(/\/idp\/profile\/Authn\/Duo\/2FA\/authorize[^"'\s]*/);
+        const duoAuthPath = body.match(
+            /\/idp\/profile\/Authn\/Duo\/2FA\/authorize[^"'\s]*/,
+        );
         if (duoAuthPath) {
-            const authUrl = new URL(duoAuthPath[0].replace(/&amp;/g, "&"), url).toString();
+            const authUrl = new URL(
+                duoAuthPath[0].replace(/&amp;/g, "&"),
+                url,
+            ).toString();
             log(`[oidc] Step 3: Found Duo authorize link → ${authUrl}`);
             const result = await followRedirects(jar, authUrl);
             url = result.url;
@@ -348,14 +456,20 @@ async function step3_navigateToDuo(
         }
 
         // Check for Duo URL embedded in JS or HTML
-        const duoEmbedded = body.match(/https:\/\/api-[a-f0-9]+\.duosecurity\.com\/[^"'\s]+/);
+        const duoEmbedded = body.match(
+            /https:\/\/api-[a-f0-9]+\.duosecurity\.com\/[^"'\s]+/,
+        );
         if (duoEmbedded) break;
 
         // Check for JS auto-redirect
-        const autoRedirect = body.match(/window\.location\s*(?:\.href\s*)?=\s*['"]([^'"]+)/i)
-            ?? body.match(/http-equiv="refresh"\s+content="\d+;\s*url=([^"]+)"/i);
+        const autoRedirect =
+            body.match(/window\.location\s*(?:\.href\s*)?=\s*['"]([^'"]+)/i) ??
+            body.match(/http-equiv="refresh"\s+content="\d+;\s*url=([^"]+)"/i);
         if (autoRedirect) {
-            const abs = new URL(autoRedirect[1].replace(/&amp;/g, "&"), url).toString();
+            const abs = new URL(
+                autoRedirect[1].replace(/&amp;/g, "&"),
+                url,
+            ).toString();
             log(`[oidc] Step 3: Following JS/meta redirect → ${abs}`);
             const result = await followRedirects(jar, abs);
             url = result.url;
@@ -365,13 +479,17 @@ async function step3_navigateToDuo(
 
         // Look for form with _eventId_proceed (Shib Web Flow auto-advance)
         const formAction = extractFormAction(body, url);
-        const hasEventProceed = body.includes("_eventId_proceed") || body.includes("_eventId=proceed");
+        const hasEventProceed =
+            body.includes("_eventId_proceed") ||
+            body.includes("_eventId=proceed");
         if (formAction && hasEventProceed) {
             const hidden = extractHiddenFields(body);
             if (!hidden._eventId_proceed) hidden._eventId_proceed = "";
             const postBody = new URLSearchParams(hidden).toString();
             log(`[oidc] Step 3: Submitting auto-proceed form → ${formAction}`);
-            const result = await followRedirects(jar, formAction, { body: postBody });
+            const result = await followRedirects(jar, formAction, {
+                body: postBody,
+            });
             url = result.url;
             body = result.body;
             continue;
@@ -382,7 +500,10 @@ async function step3_navigateToDuo(
         if (execMatch) {
             const flow = execMatch[1];
             const step = Number.parseInt(execMatch[2]) + 1;
-            const nextUrl = url.replace(/execution=e\d+s\d+/, `execution=e${flow}s${step}`);
+            const nextUrl = url.replace(
+                /execution=e\d+s\d+/,
+                `execution=e${flow}s${step}`,
+            );
             log(`[oidc] Step 3: Advancing to execution=e${flow}s${step}`);
             const result = await followRedirects(jar, nextUrl);
             url = result.url;
@@ -400,14 +521,21 @@ async function step3_navigateToDuo(
     }
 
     if (!duoUrl) {
-        const duoMatch = body.match(/https:\/\/api-[a-f0-9]+\.duosecurity\.com\/[^"'\s]+/);
+        const duoMatch = body.match(
+            /https:\/\/api-[a-f0-9]+\.duosecurity\.com\/[^"'\s]+/,
+        );
         if (duoMatch) duoUrl = duoMatch[0].replace(/&amp;/g, "&");
     }
 
     if (!duoUrl) {
-        const duoAuthMatch = body.match(/\/idp\/profile\/Authn\/Duo\/2FA\/authorize[^"'\s]*/);
+        const duoAuthMatch = body.match(
+            /\/idp\/profile\/Authn\/Duo\/2FA\/authorize[^"'\s]*/,
+        );
         if (duoAuthMatch) {
-            const authUrl = new URL(duoAuthMatch[0].replace(/&amp;/g, "&"), url).toString();
+            const authUrl = new URL(
+                duoAuthMatch[0].replace(/&amp;/g, "&"),
+                url,
+            ).toString();
             log(`[oidc] Step 3: Following Duo authorize at ${authUrl}`);
             const result = await followRedirects(jar, authUrl);
             url = result.url;
@@ -419,11 +547,13 @@ async function step3_navigateToDuo(
     }
 
     if (!duoUrl) {
-        throw new Error(`Step 3: Could not find Duo authorize URL. Current URL: ${url}`);
+        throw new Error(
+            `Step 3: Could not find Duo authorize URL. Current URL: ${url}`,
+        );
     }
 
     const shibConversationUrl = url.includes("duosecurity.com")
-        ? new URL(duoUrl).searchParams.get("redirect_uri") ?? ""
+        ? (new URL(duoUrl).searchParams.get("redirect_uri") ?? "")
         : url;
 
     log(`[oidc] Step 3: Duo authorize URL found`);
@@ -485,14 +615,23 @@ async function postExpectRedirect(
     locationMustInclude: string,
     label: string,
 ): Promise<{ location: string; status: number }> {
-    const res = await request(jar, url, { method: "POST", body, headers, redirect: "manual" });
+    const res = await request(jar, url, {
+        method: "POST",
+        body,
+        headers,
+        redirect: "manual",
+    });
     const loc = res.headers.get("location");
-    await res.text().catch(() => { /* drain */ });
+    await res.text().catch(() => {
+        /* drain */
+    });
     if (res.status < 300 || res.status >= 400) {
         throw new Error(`${label}: expected 3xx, got ${res.status}`);
     }
     if (!loc || !loc.includes(locationMustInclude)) {
-        throw new Error(`${label}: expected Location containing "${locationMustInclude}", got "${loc ?? "(none)"}"`);
+        throw new Error(
+            `${label}: expected Location containing "${locationMustInclude}", got "${loc ?? "(none)"}"`,
+        );
     }
     return { location: new URL(loc, url).toString(), status: res.status };
 }
@@ -558,7 +697,9 @@ async function step4_completeDuo(
     const formFields0 = extractHiddenFields(framelessBody);
     const xsrfFromForm = formFields0._xsrf;
     if (!xsrfFromForm) {
-        throw new Error("Step 4: could not find _xsrf hidden input in frameless HTML");
+        throw new Error(
+            "Step 4: could not find _xsrf hidden input in frameless HTML",
+        );
     }
 
     const pluginBody1 = buildPluginFormBody(framelessBody);
@@ -574,9 +715,16 @@ async function step4_completeDuo(
     };
 
     // ---------- 4a: FIRST plugin_form POST → 303 → /preauth/healthcheck ----------
-    log("[oidc] Step 4a: POST #1 plugin_form → expect 303 → /preauth/healthcheck");
+    log(
+        "[oidc] Step 4a: POST #1 plugin_form → expect 303 → /preauth/healthcheck",
+    );
     const { location: healthcheckUrl } = await postExpectRedirect(
-        jar, framelessUrl, pluginBody1, postHeaders, "/preauth/healthcheck", "Step 4a",
+        jar,
+        framelessUrl,
+        pluginBody1,
+        postHeaders,
+        "/preauth/healthcheck",
+        "Step 4a",
     );
     log(`[oidc] Step 4a: 303 Location=${new URL(healthcheckUrl).pathname}`);
 
@@ -587,48 +735,67 @@ async function step4_completeDuo(
             Referer: framelessUrl,
         },
     });
-    const xsrfFromHealthcheck = healthcheckPage.body.match(/"xsrf_token":\s*"([^"]+)"/)?.[1];
+    const xsrfFromHealthcheck = healthcheckPage.body.match(
+        /"xsrf_token":\s*"([^"]+)"/,
+    )?.[1];
     const xsrf = xsrfFromHealthcheck ?? xsrfFromForm;
     if (!xsrf) throw new Error("Step 4b: could not extract xsrf_token");
     log(`[oidc] Step 4b: xsrf=${xsrf.slice(0, 12)}...`);
 
     // ---------- 4c: AJAX GET /preauth/healthcheck/data ----------
-    const hcDataRes = await request(jar, `${duoHost}/frame/v4/preauth/healthcheck/data?sid=${encodeURIComponent(sid)}`, {
-        method: "GET",
-        headers: {
-            Accept: "*/*",
-            "X-Xsrftoken": xsrf,
-            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-            Origin: duoHost,
-            Referer: healthcheckUrl,
-            "Sec-Fetch-Site": "same-origin",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Dest": "empty",
+    const hcDataRes = await request(
+        jar,
+        `${duoHost}/frame/v4/preauth/healthcheck/data?sid=${encodeURIComponent(sid)}`,
+        {
+            method: "GET",
+            headers: {
+                Accept: "*/*",
+                "X-Xsrftoken": xsrf,
+                "Content-Type":
+                    "application/x-www-form-urlencoded;charset=UTF-8",
+                Origin: duoHost,
+                Referer: healthcheckUrl,
+                "Sec-Fetch-Site": "same-origin",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Dest": "empty",
+            },
         },
-    });
+    );
     await hcDataRes.text().catch(() => {});
     if (!hcDataRes.ok) {
-        throw new Error(`Step 4c: /preauth/healthcheck/data returned ${hcDataRes.status}`);
+        throw new Error(
+            `Step 4c: /preauth/healthcheck/data returned ${hcDataRes.status}`,
+        );
     }
     log("[oidc] Step 4c: healthcheck/data OK");
 
     // ---------- 4d: GET /frame/v4/return → 303 → frameless/v4/auth (2nd visit) ----------
-    const returnRes = await request(jar, `${duoHost}/frame/v4/return?sid=${encodeURIComponent(sid)}`, {
-        method: "GET",
-        headers: {
-            Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            Referer: healthcheckUrl,
-            "Sec-Fetch-Site": "same-origin",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Dest": "document",
-            "Upgrade-Insecure-Requests": "1",
+    const returnRes = await request(
+        jar,
+        `${duoHost}/frame/v4/return?sid=${encodeURIComponent(sid)}`,
+        {
+            method: "GET",
+            headers: {
+                Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                Referer: healthcheckUrl,
+                "Sec-Fetch-Site": "same-origin",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Dest": "document",
+                "Upgrade-Insecure-Requests": "1",
+            },
+            redirect: "manual",
         },
-        redirect: "manual",
-    });
+    );
     const returnLoc = returnRes.headers.get("location");
     await returnRes.text().catch(() => {});
-    if (returnRes.status < 300 || returnRes.status >= 400 || !returnLoc?.includes("/frame/frameless/v4/auth")) {
-        throw new Error(`Step 4d: /return expected 303 → frameless, got ${returnRes.status} ${returnLoc ?? "(no location)"}`);
+    if (
+        returnRes.status < 300 ||
+        returnRes.status >= 400 ||
+        !returnLoc?.includes("/frame/frameless/v4/auth")
+    ) {
+        throw new Error(
+            `Step 4d: /return expected 303 → frameless, got ${returnRes.status} ${returnLoc ?? "(no location)"}`,
+        );
     }
     const framelessUrl2 = new URL(returnLoc, duoHost).toString();
     const frameless2 = await followRedirects(jar, framelessUrl2, {
@@ -647,9 +814,16 @@ async function step4_completeDuo(
 
     log("[oidc] Step 4e: POST #2 plugin_form → expect 302 → /auth/prompt");
     const { location: promptUrl } = await postExpectRedirect(
-        jar, framelessUrl2, pluginBody2, postHeaders2, "/auth/prompt", "Step 4e",
+        jar,
+        framelessUrl2,
+        pluginBody2,
+        postHeaders2,
+        "/auth/prompt",
+        "Step 4e",
     );
-    log(`[oidc] Step 4e: 302 Location=${new URL(promptUrl).pathname} (trc cookie set)`);
+    log(
+        `[oidc] Step 4e: 302 Location=${new URL(promptUrl).pathname} (trc cookie set)`,
+    );
 
     // ---------- 4f: GET /auth/prompt (App.js React shell) ----------
     const promptPage = await followRedirects(jar, promptUrl, {
@@ -658,12 +832,14 @@ async function step4_completeDuo(
             Referer: framelessUrl2,
         },
     });
-    const xsrfPrompt = promptPage.body.match(/"xsrf_token":\s*"([^"]+)"/)?.[1] ?? xsrf;
+    const xsrfPrompt =
+        promptPage.body.match(/"xsrf_token":\s*"([^"]+)"/)?.[1] ?? xsrf;
 
     // ---------- 4g: GET /auth/prompt/data (device list) ----------
-    const promptDataUrl = `${duoHost}/frame/v4/auth/prompt/data?post_auth_action=OIDC_EXIT`
-        + `&browser_features=${encodeURIComponent(DUO_BROWSER_FEATURES)}`
-        + `&sid=${encodeURIComponent(sid)}`;
+    const promptDataUrl =
+        `${duoHost}/frame/v4/auth/prompt/data?post_auth_action=OIDC_EXIT` +
+        `&browser_features=${encodeURIComponent(DUO_BROWSER_FEATURES)}` +
+        `&sid=${encodeURIComponent(sid)}`;
     const promptDataRes = await request(jar, promptDataUrl, {
         method: "GET",
         headers: {
@@ -677,7 +853,7 @@ async function step4_completeDuo(
             "Sec-Fetch-Dest": "empty",
         },
     });
-    const promptData = await promptDataRes.json() as {
+    const promptData = (await promptDataRes.json()) as {
         stat: string;
         message_enum?: number;
         response: {
@@ -686,11 +862,15 @@ async function step4_completeDuo(
         };
     };
     if (promptData.stat !== "OK") {
-        throw new Error(`Step 4g: /prompt/data FAIL (message_enum=${promptData.message_enum ?? "?"}): ${JSON.stringify(promptData).slice(0, 300)}`);
+        throw new Error(
+            `Step 4g: /prompt/data FAIL (message_enum=${promptData.message_enum ?? "?"}): ${JSON.stringify(promptData).slice(0, 300)}`,
+        );
     }
     const phones = promptData.response.phones ?? [];
     const authMethods = promptData.response.auth_method_order ?? [];
-    log(`[oidc] Step 4g: Got ${phones.length} device(s), ${authMethods.length} method(s)`);
+    log(
+        `[oidc] Step 4g: Got ${phones.length} device(s), ${authMethods.length} method(s)`,
+    );
 
     // ---------- 4h: POST /frame/v4/prompt (factor submission → txid) ----------
     // Factor names verified in App.beautified.js line 27873-27876:
@@ -702,7 +882,9 @@ async function step4_completeDuo(
     // submitting a Duo-Mobile-generated passcode App.js sends factor="Passcode"
     // and device=null (App.beautified.js line 35330-35332, startPasscodeRequest).
     // URLSearchParams converts JS null → literal string "null" on the wire.
-    const usePasscode = opts.duoMethod === "passcode" || (opts.duoPasscode && opts.duoMethod !== "push");
+    const usePasscode =
+        opts.duoMethod === "passcode" ||
+        (opts.duoPasscode && opts.duoMethod !== "push");
     let factor: string;
     let device: string;
     const deviceKey = phones[0]?.key ?? "";
@@ -712,7 +894,9 @@ async function step4_completeDuo(
         factor = "Passcode";
         device = "null";
         passcode = opts.duoPasscode;
-        log(`[oidc] Step 4h: Submitting Passcode (factor="${factor}", device=null)`);
+        log(
+            `[oidc] Step 4h: Submitting Passcode (factor="${factor}", device=null)`,
+        );
     } else {
         factor = "Duo Push";
         device = phones[0]?.index ?? "phone1";
@@ -744,13 +928,15 @@ async function step4_completeDuo(
             "Sec-Fetch-Dest": "empty",
         },
     });
-    const factorData = await factorRes.json() as {
+    const factorData = (await factorRes.json()) as {
         stat: string;
         message_enum?: number;
         response?: { txid: string };
     };
     if (factorData.stat !== "OK" || !factorData.response?.txid) {
-        throw new Error(`Step 4h: /prompt FAIL (message_enum=${factorData.message_enum ?? "?"}): ${JSON.stringify(factorData).slice(0, 300)}`);
+        throw new Error(
+            `Step 4h: /prompt FAIL (message_enum=${factorData.message_enum ?? "?"}): ${JSON.stringify(factorData).slice(0, 300)}`,
+        );
     }
     const txid = factorData.response.txid;
     log(`[oidc] Step 4h: txid=${txid}`);
@@ -767,7 +953,8 @@ async function step4_completeDuo(
             headers: {
                 Accept: "*/*",
                 "X-Xsrftoken": xsrfPrompt,
-                "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+                "Content-Type":
+                    "application/x-www-form-urlencoded;charset=UTF-8",
                 Origin: duoHost,
                 Referer: promptUrl,
                 "Sec-Fetch-Site": "same-origin",
@@ -775,7 +962,7 @@ async function step4_completeDuo(
                 "Sec-Fetch-Dest": "empty",
             },
         });
-        const statusData = await statusRes.json() as {
+        const statusData = (await statusRes.json()) as {
             stat: string;
             response: {
                 status_code: string;
@@ -785,18 +972,27 @@ async function step4_completeDuo(
             };
         };
 
-        if (statusData.response.result === "SUCCESS"
-            || statusData.response.status_code === "allow") {
-            log(`[oidc] Step 4i: Duo approved — ${statusData.response.reason ?? ""}`);
+        if (
+            statusData.response.result === "SUCCESS" ||
+            statusData.response.status_code === "allow"
+        ) {
+            log(
+                `[oidc] Step 4i: Duo approved — ${statusData.response.reason ?? ""}`,
+            );
             break;
         }
         if (statusData.response.status_code === "deny") {
-            throw new Error(`Step 4i: Duo denied — ${statusData.response.reason ?? "unknown"}`);
+            throw new Error(
+                `Step 4i: Duo denied — ${statusData.response.reason ?? "unknown"}`,
+            );
         }
-        log(`[oidc] Step 4i: Polling... status=${statusData.response.status_code}`);
+        log(
+            `[oidc] Step 4i: Polling... status=${statusData.response.status_code}`,
+        );
         await new Promise((r) => setTimeout(r, pollInterval));
     }
-    if (Date.now() >= deadline) throw new Error("Step 4i: Duo approval timed out");
+    if (Date.now() >= deadline)
+        throw new Error("Step 4i: Duo approval timed out");
 
     // ---------- 4j: POST /oidc/exit → 303 to shibboleth duo-callback ----------
     const exitBody = new URLSearchParams({
@@ -826,7 +1022,9 @@ async function step4_completeDuo(
     const exitLocation = exitRes.headers.get("location");
     await exitRes.text().catch(() => {});
     if (!exitLocation || !exitLocation.includes("duo-callback")) {
-        throw new Error(`Step 4j: expected duo-callback redirect, got status=${exitRes.status} loc=${exitLocation ?? "(none)"}`);
+        throw new Error(
+            `Step 4j: expected duo-callback redirect, got status=${exitRes.status} loc=${exitLocation ?? "(none)"}`,
+        );
     }
     log("[oidc] Step 4j: Duo OIDC exit → Shibboleth duo-callback");
     return exitLocation;
@@ -861,7 +1059,10 @@ async function step5and6_completeShibbolethAndExtractToken(
 
     for (let i = 0; i < 8; i++) {
         if (jar.get(host, "token")) break;
-        if (body.includes("shib_idp_ls_success") || body.includes("_eventId_proceed")) {
+        if (
+            body.includes("shib_idp_ls_success") ||
+            body.includes("_eventId_proceed")
+        ) {
             const action = extractFormAction(body, url) ?? url;
             const hidden = extractHiddenFields(body);
             if (!hidden._eventId_proceed) hidden._eventId_proceed = "";
@@ -879,10 +1080,16 @@ async function step5and6_completeShibbolethAndExtractToken(
             continue;
         }
 
-        const nextUrl = body.match(/window\.location\s*=\s*['"]([^'"]+)/)?.[1]
-            ?? body.match(/http-equiv="refresh"\s+content="\d+;url=([^"]+)"/i)?.[1];
+        const nextUrl =
+            body.match(/window\.location\s*=\s*['"]([^'"]+)/)?.[1] ??
+            body.match(
+                /http-equiv="refresh"\s+content="\d+;url=([^"]+)"/i,
+            )?.[1];
         if (nextUrl) {
-            const result = await followRedirects(jar, new URL(nextUrl, url).toString());
+            const result = await followRedirects(
+                jar,
+                new URL(nextUrl, url).toString(),
+            );
             url = result.url;
             body = result.body;
             continue;
@@ -901,9 +1108,9 @@ async function step5and6_completeShibbolethAndExtractToken(
     const token = jar.get(host, "token");
     if (!token) {
         throw new Error(
-            `Step 5: No token cookie received; ended at ${url}. `
-            + `Chat.ai2s.org either didn't complete the OIDC exchange or `
-            + `set the cookie under a different name.`,
+            `Step 5: No token cookie received; ended at ${url}. ` +
+                `Chat.ai2s.org either didn't complete the OIDC exchange or ` +
+                `set the cookie under a different name.`,
         );
     }
     const oauthIdToken = jar.get(host, "oauth_id_token") ?? "";
@@ -913,12 +1120,18 @@ async function step5and6_completeShibbolethAndExtractToken(
     const parts = token.split(".");
     if (parts.length === 3) {
         try {
-            const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+            const payload = JSON.parse(
+                Buffer.from(parts[1], "base64url").toString("utf8"),
+            );
             if (typeof payload.exp === "number") expiresAt = payload.exp * 1000;
-        } catch { /* fallback expiry */ }
+        } catch {
+            /* fallback expiry */
+        }
     }
 
-    log(`[oidc] Step 5: Got token, expires ${new Date(expiresAt).toISOString()}`);
+    log(
+        `[oidc] Step 5: Got token, expires ${new Date(expiresAt).toISOString()}`,
+    );
     return { token, oauthIdToken, oauthSessionId, expiresAt };
 }
 
@@ -931,29 +1144,63 @@ async function step5and6_completeShibbolethAndExtractToken(
  *
  * @returns Fresh Open WebUI JWT + metadata
  */
-export async function oidcLogin(opts: OidcLoginOptions): Promise<OidcLoginResult> {
+export async function oidcLogin(
+    opts: OidcLoginOptions,
+): Promise<OidcLoginResult> {
     const jar = loadCookieJar() ?? new CookieJar();
     const baseUrl = opts.baseUrl.replace(/\/$/, "");
 
     const shibUrl = await step1_initiateOidc(jar, baseUrl);
 
-    const { url: afterCreds, body: afterCredsBody, skippedCredentials } =
-        await step2_submitCredentials(jar, shibUrl, opts.username, opts.password);
+    const {
+        url: afterCreds,
+        body: afterCredsBody,
+        skippedCredentials,
+    } = await step2_submitCredentials(
+        jar,
+        shibUrl,
+        opts.username,
+        opts.password,
+    );
 
-    if (afterCreds.includes("oauth/oidc/callback") || afterCreds.includes(`${baseUrl}/auth`)) {
-        log("[oidc] Session fully alive — Shibboleth skipped straight to OIDC callback");
-        const result = await step5and6_completeShibbolethAndExtractToken(jar, afterCreds, baseUrl);
+    if (
+        afterCreds.includes("oauth/oidc/callback") ||
+        afterCreds.includes(`${baseUrl}/auth`)
+    ) {
+        log(
+            "[oidc] Session fully alive — Shibboleth skipped straight to OIDC callback",
+        );
+        const result = await step5and6_completeShibbolethAndExtractToken(
+            jar,
+            afterCreds,
+            baseUrl,
+        );
         saveCookieJar(jar);
         return result;
     }
 
-    const { duoAuthorizeUrl, duoBody } = await step3_navigateToDuo(jar, afterCreds, afterCredsBody);
-    const duoCallbackUrl = await step4_completeDuo(jar, duoAuthorizeUrl, duoBody, opts);
-    const result = await step5and6_completeShibbolethAndExtractToken(jar, duoCallbackUrl, baseUrl);
+    const { duoAuthorizeUrl, duoBody } = await step3_navigateToDuo(
+        jar,
+        afterCreds,
+        afterCredsBody,
+    );
+    const duoCallbackUrl = await step4_completeDuo(
+        jar,
+        duoAuthorizeUrl,
+        duoBody,
+        opts,
+    );
+    const result = await step5and6_completeShibbolethAndExtractToken(
+        jar,
+        duoCallbackUrl,
+        baseUrl,
+    );
 
     saveCookieJar(jar);
     if (skippedCredentials) {
-        log("[oidc] Shibboleth session was reused (credentials skipped), Duo still required");
+        log(
+            "[oidc] Shibboleth session was reused (credentials skipped), Duo still required",
+        );
     }
     return result;
 }
