@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import {
+    parseRetryAfterMs,
     sanitizeBedrockContent,
     sanitizeContentBlock,
     sanitizeMessageContent,
@@ -238,12 +239,50 @@ describe("sanitizeBedrockContent", () => {
         };
         sanitizeBedrockContent(body);
         const json = JSON.stringify(body);
-        const textValues = [...json.matchAll(/"text":"((?:[^"\\]|\\.)*)"/g)].map(
-            (m) => m[1],
-        );
+        const textValues = [
+            ...json.matchAll(/"text":"((?:[^"\\]|\\.)*)"/g),
+        ].map((m) => m[1]);
         for (const v of textValues) {
             expect(containsWhitespaceOnly(v)).toBe(false);
             expect(v).not.toBe("");
         }
+    });
+});
+
+describe("parseRetryAfterMs", () => {
+    const withHeader = (value: string | null): Response => {
+        const headers = new Headers();
+        if (value !== null) headers.set("retry-after", value);
+        return new Response(null, { headers });
+    };
+
+    it("returns undefined when the header is absent", () => {
+        expect(parseRetryAfterMs(withHeader(null))).toBeUndefined();
+    });
+
+    it("parses delta-seconds into milliseconds", () => {
+        expect(parseRetryAfterMs(withHeader("0"))).toBe(0);
+        expect(parseRetryAfterMs(withHeader("2"))).toBe(2000);
+        expect(parseRetryAfterMs(withHeader("120"))).toBe(120000);
+    });
+
+    it("clamps negative delta-seconds to 0", () => {
+        expect(parseRetryAfterMs(withHeader("-5"))).toBe(0);
+    });
+
+    it("parses an HTTP-date into a future delay", () => {
+        const future = new Date(Date.now() + 5000).toUTCString();
+        const ms = parseRetryAfterMs(withHeader(future));
+        expect(ms).toBeGreaterThan(3000);
+        expect(ms).toBeLessThanOrEqual(5000);
+    });
+
+    it("returns 0 for a past HTTP-date", () => {
+        const past = new Date(Date.now() - 60000).toUTCString();
+        expect(parseRetryAfterMs(withHeader(past))).toBe(0);
+    });
+
+    it("returns undefined for an unparseable value", () => {
+        expect(parseRetryAfterMs(withHeader("soon"))).toBeUndefined();
     });
 });

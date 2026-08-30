@@ -35,9 +35,41 @@ function bodyLog(path: string, entry: Record<string, unknown>): void {
 
 // 529 = Anthropic "overloaded" — explicitly retryable per v138 CLI.
 const RETRY_STATUSES = new Set([502, 503, 504, 529]);
+// 429 = rate limited. This OWUI instance runs an active rate_limit_inlet_filter,
+// and upstream (Anthropic/Bedrock) also emit 429 with a Retry-After hint. Handle
+// it separately so we can honor Retry-After instead of the generic backoff.
+const RATE_LIMIT_STATUS = 429;
 const AUTH_RETRY_STATUSES = new Set([401, 403]);
 const MAX_RETRIES = 2;
 const RETRY_BASE_MS = 1500;
+// Refresh the session token this long BEFORE it actually expires, so a long
+// streaming request started near the boundary doesn't die mid-flight. The OWUI
+// token is a fixed ~28-day window (not sliding) and there is no refresh_token, so
+// renewal means a full OIDC re-login — worth doing proactively, not mid-request.
+// Override with OWUI_REFRESH_SKEW_MS.
+const DEFAULT_REFRESH_SKEW_MS = 10 * 60_000; // 10 minutes
+function refreshSkewMs(): number {
+    const raw = Number(process.env.OWUI_REFRESH_SKEW_MS);
+    return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_REFRESH_SKEW_MS;
+}
+// Cap how long we will wait on a Retry-After before giving up, so a hostile or
+// buggy header (e.g. "Retry-After: 3600") can't stall a request indefinitely.
+const MAX_RETRY_AFTER_MS = 30_000;
+
+/**
+ * Parse an HTTP Retry-After header into milliseconds.
+ * Supports both the delta-seconds form ("120") and the HTTP-date form
+ * ("Wed, 21 Oct 2026 07:28:00 GMT"). Returns undefined if absent/unparseable.
+ */
+export function parseRetryAfterMs(res: Response): number | undefined {
+    const raw = res.headers.get("retry-after");
+    if (!raw) return undefined;
+    const secs = Number(raw);
+    if (Number.isFinite(secs)) return Math.max(0, secs * 1000);
+    const when = Date.parse(raw);
+    if (Number.isFinite(when)) return Math.max(0, when - Date.now());
+    return undefined;
+}
 
 // LiteLLM v1.81–1.84+ misclassifies Bedrock's serviceUnavailableException as
 // HTTP 400 (BadRequestError) instead of 503. The Bedrock event stream decoder
@@ -156,10 +188,7 @@ export function sanitizeBedrockContent(body: unknown): void {
             inner.length === 0
                 ? [{ type: "text", text: BLANK_TEXT_PLACEHOLDER }]
                 : inner;
-    } else if (
-        typeof obj.system === "string" &&
-        obj.system.trim() === ""
-    ) {
+    } else if (typeof obj.system === "string" && obj.system.trim() === "") {
         obj.system = BLANK_TEXT_PLACEHOLDER;
     }
 
@@ -365,10 +394,9 @@ function interceptUsage(
                 if (abortController.signal.aborted) break;
                 const { done, value } = await reader.read();
                 if (done) break;
-                buffer += decoder.decode(
-                    value as Uint8Array | undefined,
-                    { stream: true },
-                );
+                buffer += decoder.decode(value as Uint8Array | undefined, {
+                    stream: true,
+                });
                 if (buffer.length > 4096) {
                     buffer = buffer.slice(-4096);
                 }
@@ -442,9 +470,10 @@ export function makeOwuiFetch(storage: Storage) {
         if (account.disabled) {
             throw new Error(`Account ${account.name} is disabled`);
         }
-        if (isTokenExpired(account.token, 0)) {
+        if (isTokenExpired(account.token, refreshSkewMs())) {
+            const expired = isTokenExpired(account.token, 0);
             log(
-                `[fetch] token expired for ${account.name} — attempting auto-refresh`,
+                `[fetch] token ${expired ? "expired" : "near expiry"} for ${account.name} — attempting proactive refresh`,
             );
             const username = process.env.OWUI_USERNAME;
             const password = process.env.OWUI_PASSWORD;
@@ -520,10 +549,17 @@ export function makeOwuiFetch(storage: Storage) {
 
         let lastRes: Response | undefined;
         let didAuthRetry = false;
+        // When a 429 carries a Retry-After, the next iteration waits exactly that
+        // long instead of the generic exponential backoff.
+        let pendingDelayMs: number | undefined;
         for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
             if (attempt > 0) {
-                const baseDelay = RETRY_BASE_MS * 2 ** (attempt - 1);
-                const delay = baseDelay * (0.5 + Math.random() * 0.5);
+                const delay =
+                    pendingDelayMs ??
+                    RETRY_BASE_MS *
+                        2 ** (attempt - 1) *
+                        (0.5 + Math.random() * 0.5);
+                pendingDelayMs = undefined;
                 log(
                     `[fetch] retry #${attempt} in ${Math.round(delay)}ms after ${lastRes?.status ?? "?"}...`,
                 );
@@ -583,6 +619,35 @@ export function makeOwuiFetch(storage: Storage) {
                         );
                     }
                 }
+            }
+
+            // Rate limited (429). The instance's rate_limit_inlet_filter and the
+            // upstream provider both emit this; honor Retry-After when present,
+            // clamped to MAX_RETRY_AFTER_MS, otherwise fall through to backoff.
+            if (res.status === RATE_LIMIT_STATUS && attempt < MAX_RETRIES) {
+                const retryAfter = parseRetryAfterMs(res);
+                pendingDelayMs =
+                    retryAfter !== undefined
+                        ? Math.min(retryAfter, MAX_RETRY_AFTER_MS)
+                        : undefined;
+                log(
+                    `[fetch] 429 rate limited — ${
+                        pendingDelayMs !== undefined
+                            ? `Retry-After ${Math.round(pendingDelayMs)}ms`
+                            : "no Retry-After, using backoff"
+                    }`,
+                );
+                try {
+                    const text = await res.text();
+                    bodyLog(RES_LOG, {
+                        url: url.toString(),
+                        status: res.status,
+                        body: text.slice(0, 500),
+                        retryAfterMs: pendingDelayMs ?? null,
+                        attempt,
+                    });
+                } catch {}
+                continue;
             }
 
             const xShouldRetry = res.headers.get("x-should-retry");
