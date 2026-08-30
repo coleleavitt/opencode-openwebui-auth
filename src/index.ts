@@ -179,7 +179,10 @@ export const OpenWebUIAuthPlugin = async (_input: PluginInput) => {
     };
 };
 
-export default OpenWebUIAuthPlugin;
+export default {
+    id: "opencode-openwebui-auth",
+    server: OpenWebUIAuthPlugin,
+};
 
 export type { OpenWebUIAccount, PerModelUsage } from "./types";
 export { getCombinedTotalUsage } from "./storage";

@@ -33,7 +33,8 @@ function bodyLog(path: string, entry: Record<string, unknown>): void {
     } catch {}
 }
 
-const RETRY_STATUSES = new Set([502, 503, 504]);
+// 529 = Anthropic "overloaded" — explicitly retryable per v138 CLI.
+const RETRY_STATUSES = new Set([502, 503, 504, 529]);
 const AUTH_RETRY_STATUSES = new Set([401, 403]);
 const MAX_RETRIES = 2;
 const RETRY_BASE_MS = 1500;
@@ -521,9 +522,10 @@ export function makeOwuiFetch(storage: Storage) {
         let didAuthRetry = false;
         for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
             if (attempt > 0) {
-                const delay = RETRY_BASE_MS * 2 ** (attempt - 1);
+                const baseDelay = RETRY_BASE_MS * 2 ** (attempt - 1);
+                const delay = baseDelay * (0.5 + Math.random() * 0.5);
                 log(
-                    `[fetch] retry #${attempt} in ${delay}ms after ${lastRes?.status ?? "?"}...`,
+                    `[fetch] retry #${attempt} in ${Math.round(delay)}ms after ${lastRes?.status ?? "?"}...`,
                 );
                 await new Promise((r) => setTimeout(r, delay));
             }
@@ -583,7 +585,12 @@ export function makeOwuiFetch(storage: Storage) {
                 }
             }
 
-            if (RETRY_STATUSES.has(res.status) && attempt < MAX_RETRIES) {
+            const xShouldRetry = res.headers.get("x-should-retry");
+            const shouldRetry =
+                xShouldRetry === "true" ||
+                (xShouldRetry !== "false" && RETRY_STATUSES.has(res.status));
+
+            if (shouldRetry && attempt < MAX_RETRIES) {
                 try {
                     const text = await res.text();
                     bodyLog(RES_LOG, {

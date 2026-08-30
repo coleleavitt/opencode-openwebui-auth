@@ -47,16 +47,19 @@ export async function listModels(baseUrl: string, token: string): Promise<OpenWe
 
 type ModelLimits = { context: number; output: number };
 
-// Sourced from LiteLLM v1.81.12 model_prices_and_context_window.json
-// (cloned at ~/VulnerabilityResearch/chat_ai2s_org/litellm/ tag v1.81.12-stable.2).
-// OWUI's /api/models returns context_length: null for all models, so we infer
-// from the model ID/name. Ordered most-specific-first; first match wins.
+// Model limits sourced from Anthropic v2.1.137 CLI (sAH() function) + LiteLLM
+// v1.81.12 model_prices_and_context_window.json. Ordered most-specific-first.
 const MODEL_LIMITS: [RegExp, ModelLimits][] = [
+    [/claude.*mythos/i,              { context: 1000000, output: 128000 }],
+    [/claude.*opus.*4[._-]?7/i,      { context: 1000000, output: 128000 }],
     [/claude.*opus.*4[._-]?6/i,      { context: 1000000, output: 128000 }],
     [/claude.*opus.*4[._-]?5/i,      { context: 200000,  output: 64000 }],
     [/claude.*opus.*4[._-]?[01]/i,   { context: 200000,  output: 32000 }],
     [/claude.*haiku.*4[._-]?5/i,     { context: 200000,  output: 64000 }],
-    [/claude.*sonnet.*4[._-]?[56]/i, { context: 200000,  output: 64000 }],
+    // sonnet-4-6 default output is 32K per v138 sAH() — not 64K.
+    // 128K output requires the output-128k-2025-02-19 beta header.
+    [/claude.*sonnet.*4[._-]?6/i,    { context: 200000,  output: 32000 }],
+    [/claude.*sonnet.*4[._-]?5/i,    { context: 200000,  output: 64000 }],
     [/claude.*sonnet.*4/i,           { context: 200000,  output: 16000 }],
     [/claude/i,                      { context: 200000,  output: 16000 }],
     [/gpt.*5/i,                      { context: 1000000, output: 100000 }],
@@ -80,6 +83,43 @@ function inferModelLimits(modelId: string, modelName: string): ModelLimits {
     return DEFAULT_LIMITS;
 }
 
+// Claude models that support adaptive thinking via the Anthropic API.
+// Adaptive thinking (type: "adaptive") is the correct form for Claude 4.x —
+// the legacy { type: "enabled", budgetTokens } form still works but is
+// deprecated. Claude 4.6+ also supports xhigh effort via adaptive.
+// The OWUI proxy forwards these params verbatim to the underlying provider
+// (Bedrock, direct Anthropic, etc.) so we can set the full variant map here.
+const CLAUDE_EFFORTS_BASE = ["low", "medium", "high", "max"] as const
+const CLAUDE_EFFORTS_XHIGH = ["low", "medium", "high", "xhigh", "max"] as const
+// xhigh effort is opus-4-7 / mythos only per Anthropic v2.1.137 CLI (E5$ fn).
+const CLAUDE_MODELS_WITH_XHIGH = /claude.*(opus.*4[._-]?7|mythos)/i
+const CLAUDE_MODELS_WITH_ADAPTIVE_THINKING = /claude.*(sonnet|opus|haiku|mythos).*(4[._-]?[56789]|[5-9][._-]?[0-9]|preview)/i
+
+function buildClaudeVariants(modelId: string): Record<string, unknown> {
+    if (!CLAUDE_MODELS_WITH_ADAPTIVE_THINKING.test(modelId)) {
+        return {
+            high: { thinking: { type: "enabled", budgetTokens: 16000 } },
+            max: { thinking: { type: "enabled", budgetTokens: 31999 } },
+        }
+    }
+    const isOpus47 = CLAUDE_MODELS_WITH_XHIGH.test(modelId)
+    const efforts = isOpus47 ? CLAUDE_EFFORTS_XHIGH : CLAUDE_EFFORTS_BASE
+    return Object.fromEntries(
+        efforts.map((effort) => [
+            effort,
+            {
+                thinking: {
+                    type: "adaptive",
+                    // opus-4-7 specific: summarized display reduces token
+                    // overhead of reasoning traces in multi-turn contexts.
+                    ...(isOpus47 ? { display: "summarized" } : {}),
+                },
+                effort,
+            },
+        ]),
+    )
+}
+
 export function buildOpencodeModel(
     providerID: string,
     baseUrl: string,
@@ -88,6 +128,7 @@ export function buildOpencodeModel(
 ): Record<string, unknown> {
     const caps = raw.info?.meta?.capabilities ?? {};
     const limits = inferModelLimits(raw.id, raw.name ?? "");
+    const isClaude = /claude/i.test(raw.id)
     return {
         id: raw.id,
         providerID,
@@ -101,7 +142,10 @@ export function buildOpencodeModel(
         limit: { context: limits.context, output: limits.output },
         capabilities: {
             temperature: true,
-            reasoning: false,
+            // Claude models support adaptive thinking. Non-Claude models
+            // go through the generic openai-compatible path (reasoningEffort)
+            // which transform.ts handles separately when reasoning: true.
+            reasoning: isClaude,
             attachment: Boolean(caps.file_upload || caps.vision),
             toolcall: Boolean(caps.builtin_tools ?? true),
             input: {
@@ -121,6 +165,6 @@ export function buildOpencodeModel(
             interleaved: false,
         },
         release_date: "",
-        variants: {},
+        variants: isClaude ? buildClaudeVariants(raw.id) : {},
     };
 }
