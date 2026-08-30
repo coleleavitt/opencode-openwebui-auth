@@ -1,0 +1,36 @@
+{
+  "name": "opencode-openwebui-auth",
+  "version": "0.0.1",
+  "type": "module",
+  "description": "opencode plugin that routes chat completions through an OpenWebUI instance using a user JWT",
+  "main": "./dist/bundle.js",
+  "exports": {
+    ".": {
+      "import": "./dist/bundle.js"
+    }
+  },
+  "bin": {
+    "opencode-openwebui-auth": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc --noEmit && bun build src/index.ts --outfile dist/bundle.js --target=node --format=esm && bun build src/cli.ts --outfile dist/cli.js --target=node --format=esm",
+    "build:typecheck": "tsc --noEmit",
+    "build:bundle": "bun build src/index.ts --outfile dist/bundle.js --target=node --format=esm",
+    "dev": "tsc --watch --noEmit",
+    "test": "bun test src",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check src/",
+    "lint:fix": "biome check --write src/"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "*"
+  },
+  "dependencies": {
+    "@openwebui-auth/core": "workspace:*"
+  }
+}

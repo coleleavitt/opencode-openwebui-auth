@@ -1,9 +1,14 @@
 #!/usr/bin/env bun
-import { Storage } from "./storage";
-import { fetchInstanceConfig, listModels, normalizeBaseUrl, verifyToken } from "./oauth/api";
-import { parseJwtClaims } from "./oauth/jwt";
-import { oidcLogin } from "./oauth/oidc-login";
-import type { OpenWebUIAccount } from "./types";
+import {
+    fetchInstanceConfig,
+    listModels,
+    normalizeBaseUrl,
+    oidcLogin,
+    type OpenWebUIAccount,
+    parseJwtClaims,
+    Storage,
+    verifyToken,
+} from "@openwebui-auth/core";
 
 function usage(): never {
     console.log(`opencode-openwebui-auth CLI

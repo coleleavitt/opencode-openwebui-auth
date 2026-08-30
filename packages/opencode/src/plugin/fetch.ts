@@ -1,11 +1,15 @@
 import { appendFileSync, chmodSync, existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { log, logRequest, logResponse } from "../logger";
-import { isTokenExpired } from "../oauth/jwt";
-import { oidcLogin } from "../oauth/oidc-login";
-import type { Storage } from "../storage";
-import type { OpenWebUIAccount } from "../types";
+import {
+    isTokenExpired,
+    log,
+    logRequest,
+    logResponse,
+    oidcLogin,
+    type OpenWebUIAccount,
+    type Storage,
+} from "@openwebui-auth/core";
 
 const BODY_LOG_DIR = join(
     homedir(),

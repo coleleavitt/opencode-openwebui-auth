@@ -1,0 +1,39 @@
+{
+  "name": "@openwebui-auth/pi",
+  "version": "0.0.1",
+  "type": "module",
+  "description": "pi extension: OpenWebUI (Shibboleth OIDC) as an OpenAI-compatible provider",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && bun build src/index.ts --outfile dist/index.js --target=node --format=esm --external @earendil-works/* && tsc -p tsconfig.build.json --emitDeclarationOnly",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "bun run build"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "dependencies": {
+    "@openwebui-auth/core": "workspace:*"
+  }
+}

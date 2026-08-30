@@ -1,4 +1,4 @@
-# lefthook.yml — git hooks for opencode-openwebui-auth
+# lefthook.yml — git hooks for the openwebui-auth monorepo
 # Install once with:  lefthook install
 # Runtime: bun (the project's toolchain). Biome for lint/format, tsc for types.
 
@@ -9,28 +9,28 @@ pre-commit:
     # lines that are already formatted, so it won't drag unrelated diffs into your
     # commit). Formatting alone never fails the commit.
     format:
-      glob: "src/**/*.{ts,tsx,js,jsx,json}"
+      glob: "packages/*/src/**/*.{ts,tsx,js,jsx,json}"
       run: bunx biome format --write --no-errors-on-unmatched {staged_files}
       stage_fixed: true
     # Lint REPORT on staged files — informational only (non-blocking). This repo
     # keeps some intentional style (non-null assertions etc.), so lint never gates
     # the commit; the hard gate is the typecheck below.
     lint:
-      glob: "src/**/*.{ts,tsx,js,jsx,json}"
+      glob: "packages/*/src/**/*.{ts,tsx,js,jsx,json}"
       run: bunx biome check --no-errors-on-unmatched {staged_files} || true
-    # Hard gate: the project must still typecheck. Fast, whole-project.
+    # Hard gate: every package must still typecheck.
     typecheck:
-      run: bun run build:typecheck
+      run: bun run typecheck
       fail_text: "type errors — fix before committing"
 
 pre-push:
   parallel: false
   commands:
-    # Full build (typecheck + bundle) must pass before code leaves the machine.
+    # Full workspace build (core -> opencode -> pi) must pass before pushing.
     build:
       run: bun run build
       fail_text: "build failed — not pushing"
-    # Run the test suite (bun test is a no-op if nothing matches).
+    # Run the test suites (core + opencode).
     test:
-      run: bun test
+      run: bun run test
       fail_text: "tests failed — fix before pushing"

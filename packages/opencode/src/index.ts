@@ -1,9 +1,16 @@
 import type { PluginInput } from "@opencode-ai/plugin";
-import { Storage } from "./storage";
-import { log, logAuth } from "./logger";
-import { buildOpencodeModel, fetchInstanceConfig, listModels, normalizeBaseUrl, verifyToken } from "./oauth/api";
-import { parseJwtClaims } from "./oauth/jwt";
-import { oidcLogin } from "./oauth/oidc-login";
+import {
+    fetchInstanceConfig,
+    listModels,
+    log,
+    logAuth,
+    normalizeBaseUrl,
+    oidcLogin,
+    parseJwtClaims,
+    Storage,
+    verifyToken,
+} from "@openwebui-auth/core";
+import { buildOpencodeModel } from "./oauth/model";
 import { makeOwuiFetch } from "./plugin/fetch";
 
 const PROVIDER_ID = "openwebui";
@@ -184,5 +191,5 @@ export default {
     server: OpenWebUIAuthPlugin,
 };
 
-export type { OpenWebUIAccount, PerModelUsage } from "./types";
-export { getCombinedTotalUsage } from "./storage";
+export type { OpenWebUIAccount, PerModelUsage } from "@openwebui-auth/core";
+export { getCombinedTotalUsage } from "@openwebui-auth/core";
