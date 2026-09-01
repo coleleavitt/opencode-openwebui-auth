@@ -30,7 +30,7 @@ instance owner pays, not you):
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
-    "file:///home/you/WebstormProjects/opencode-openwebui-auth/dist/bundle.js"
+    "file:///home/you/WebstormProjects/opencode-openwebui-auth/packages/opencode/dist/bundle.js"
   ],
   "provider": {
     "openwebui": {}
