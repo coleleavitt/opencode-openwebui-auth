@@ -2,25 +2,24 @@ import { appendFileSync, chmodSync, existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
+    AUTH_RETRY_STATUSES,
     isTokenExpired,
     log,
     logRequest,
     logResponse,
-    AUTH_RETRY_STATUSES,
     MAX_RETRIES,
     MAX_RETRY_AFTER_MS,
-    oidcLogin,
     type OpenWebUIAccount,
+    oidcLogin,
     parseRetryAfterMs,
     parseUsageFromBuffer,
     RATE_LIMIT_STATUS,
-    refreshSkewMs,
     RETRY_BASE_MS,
     RETRY_STATUSES,
     RETRYABLE_BODY_PATTERNS,
-    sanitizeBedrockContent,
-    scrubBedrockToolFields,
+    refreshSkewMs,
     type Storage,
+    shapeBedrockRequestBody,
 } from "@openwebui-auth/core";
 
 const BODY_LOG_DIR = join(
@@ -92,8 +91,7 @@ function rewriteBody(
         return { init, original: null, rewritten: null };
     }
     const original = JSON.parse(JSON.stringify(parsed));
-    const scrubbed = scrubBedrockToolFields(parsed);
-    sanitizeBedrockContent(scrubbed);
+    const scrubbed = shapeBedrockRequestBody(parsed as Record<string, unknown>);
 
     const obj = scrubbed as Record<string, unknown>;
     if (obj.stream === true) {

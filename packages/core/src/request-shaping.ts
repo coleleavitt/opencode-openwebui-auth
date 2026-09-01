@@ -116,6 +116,65 @@ export function sanitizeBedrockContent(body: unknown): void {
     }
 }
 
+const ORPHANED_TOOL_CALL_RESULT =
+    "Error: no result was recorded for this tool call — the host exited before it returned.";
+
+/**
+ * Give every `tool_calls` entry a matching tool-role reply.
+ *
+ * Bedrock hard-rejects an assistant turn whose tool call never got an output
+ * ("No tool output found for function call <id>"), and a transcript only has to
+ * lose one result to earn that 400 on every later request — a crashed host mid
+ * tool call permanently wedges the session, since each retry replays the same
+ * gap. Synthesizing the missing reply is what makes the history sendable again;
+ * an errored result is honest about what happened and lets the model retry.
+ *
+ * Replies must sit directly after their assistant turn, so each insert goes at
+ * the end of that turn's existing run of tool messages rather than at the end
+ * of the conversation.
+ */
+export function repairDanglingToolCalls(body: unknown): unknown {
+    if (!body || typeof body !== "object") return body;
+    const obj = body as Record<string, unknown>;
+    const messages = obj.messages;
+    if (!Array.isArray(messages)) return body;
+
+    const repaired: unknown[] = [];
+    for (let i = 0; i < messages.length; i++) {
+        const msg = messages[i];
+        repaired.push(msg);
+        if (!msg || typeof msg !== "object") continue;
+        const m = msg as Record<string, unknown>;
+        if (m.role !== "assistant" || !Array.isArray(m.tool_calls)) continue;
+
+        const answered = new Set<string>();
+        while (i + 1 < messages.length) {
+            const next = messages[i + 1];
+            if (!next || typeof next !== "object") break;
+            const n = next as Record<string, unknown>;
+            if (n.role !== "tool") break;
+            if (typeof n.tool_call_id === "string")
+                answered.add(n.tool_call_id);
+            repaired.push(next);
+            i++;
+        }
+
+        for (const call of m.tool_calls as unknown[]) {
+            if (!call || typeof call !== "object") continue;
+            const id = (call as Record<string, unknown>).id;
+            if (typeof id !== "string" || answered.has(id)) continue;
+            repaired.push({
+                role: "tool",
+                tool_call_id: id,
+                content: ORPHANED_TOOL_CALL_RESULT,
+            });
+        }
+    }
+
+    obj.messages = repaired;
+    return obj;
+}
+
 /** Strip/repair tool-related fields Bedrock rejects. Returns the same object. */
 export function scrubBedrockToolFields(body: unknown): unknown {
     if (!body || typeof body !== "object") return body;
@@ -165,12 +224,14 @@ export function scrubBedrockToolFields(body: unknown): unknown {
 
 /**
  * Apply the full Bedrock-safety pass to a parsed request body, in place.
- * Order matters: scrub tool fields first (may inject a dummy tool), then
- * sanitize blank content. Returns the same object for convenience.
+ * Order matters: repair dangling tool calls first so the synthesized replies are
+ * visible to the tool-reference scan, then scrub tool fields (may inject a dummy
+ * tool), then sanitize blank content. Returns the same object for convenience.
  */
 export function shapeBedrockRequestBody(
     body: Record<string, unknown>,
 ): Record<string, unknown> {
+    repairDanglingToolCalls(body);
     scrubBedrockToolFields(body);
     sanitizeBedrockContent(body);
     return body;
