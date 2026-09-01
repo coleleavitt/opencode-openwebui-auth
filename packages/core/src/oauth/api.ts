@@ -117,7 +117,9 @@ const MODEL_LIMITS: [RegExp, ModelLimits][] = [
     [/llama.*4.*maverick/i, { context: 1000000, output: 8192 }],
     [/llama.*4/i, { context: 131072, output: 16384 }],
     [/llama.*3/i, { context: 131072, output: 8192 }],
-    [/gemma.*3/i, { context: 128000, output: 131072 }],
+    // Output was 131072 — the context limit duplicated. Impossible as an output
+    // cap, and max_tokens=131072 does 400 live; 8192 is Gemma 3's real ceiling.
+    [/gemma.*3/i, { context: 128000, output: 8192 }],
     [/gemini.*2/i, { context: 1048576, output: 65536 }],
     [/nova.*pro/i, { context: 300000, output: 10000 }],
     [/nova.*lite/i, { context: 300000, output: 5000 }],
@@ -135,40 +137,72 @@ export function inferModelLimits(
     return DEFAULT_LIMITS;
 }
 
-// Claude models that support adaptive thinking via the Anthropic API.
-// Adaptive thinking (type: "adaptive") is the correct form for Claude 4.x —
-// the legacy { type: "enabled", budgetTokens } form still works but is
-// deprecated. Claude 4.6+ also supports xhigh effort via adaptive.
-// The OWUI proxy forwards these params verbatim to the underlying provider
-// (Bedrock, direct Anthropic, etc.) so we can set the full variant map here.
 const CLAUDE_EFFORTS_BASE = ["low", "medium", "high", "max"] as const;
 const CLAUDE_EFFORTS_XHIGH = ["low", "medium", "high", "xhigh", "max"] as const;
-// xhigh effort is opus-4-7 / mythos only per Anthropic v2.1.137 CLI (E5$ fn).
-const CLAUDE_MODELS_WITH_XHIGH = /claude.*(opus.*4[._-]?7|mythos)/i;
-const CLAUDE_MODELS_WITH_ADAPTIVE_THINKING =
-    /claude.*(sonnet|opus|haiku|mythos).*(4[._-]?[56789]|[5-9][._-]?[0-9]|preview)/i;
 
+/**
+ * Claude generation as a number (`claude-5-opus` -> 5, `claude-opus-4-6` -> 4.6).
+ *
+ * Ids order family and version either way, so parse rather than pattern-match:
+ * a regex anchored on one order silently misses the other and drops the model
+ * onto the legacy thinking path, which Claude 5 rejects outright. Date stamps
+ * are stripped first or `claude-sonnet-4-20250514` reads as generation 4.2.
+ */
+function claudeGeneration(modelId: string): number | null {
+    const match = modelId
+        .replace(/\d{6,}/g, "")
+        .match(/claude\D*(\d)(?:[._-](\d))?/i);
+    if (!match) return null;
+    return Number(match[2] ? `${match[1]}.${match[2]}` : match[1]);
+}
+
+/**
+ * Thinking params per effort level, keyed by effort name.
+ *
+ * Shape is dictated by the provider, which rejects everything else (verified
+ * live against this deployment):
+ *   - `thinking.type: "enabled"` 400s on Claude 5 — "use thinking.type.adaptive
+ *     and output_config.effort". Legacy is only safe below 4.6.
+ *   - effort belongs in `output_config`; top-level or nested under `thinking`
+ *     both 400 with "Extra inputs are not permitted".
+ *   - Haiku accepts adaptive but no effort at all ("This model does not support
+ *     the effort parameter"), so its levels must carry thinking only.
+ * xhigh is opus 4.6+ and any 5.x; sonnet 4.6 rejects it.
+ */
 export function buildClaudeVariants(modelId: string): Record<string, unknown> {
-    if (!CLAUDE_MODELS_WITH_ADAPTIVE_THINKING.test(modelId)) {
+    const generation = claudeGeneration(modelId);
+    const isMythos = /mythos/i.test(modelId);
+    const family = /opus|sonnet|haiku/i.exec(modelId)?.[0].toLowerCase();
+
+    if (!isMythos && (generation === null || generation < 4.5)) {
         return {
             high: { thinking: { type: "enabled", budgetTokens: 16000 } },
             max: { thinking: { type: "enabled", budgetTokens: 31999 } },
         };
     }
-    const isOpus47 = CLAUDE_MODELS_WITH_XHIGH.test(modelId);
-    const efforts = isOpus47 ? CLAUDE_EFFORTS_XHIGH : CLAUDE_EFFORTS_BASE;
+
+    const generationOf = generation ?? 0;
+    // Summarized display keeps reasoning traces from dominating multi-turn
+    // context on the models that emit the longest ones.
+    const thinking = {
+        type: "adaptive",
+        ...(isMythos || (family === "opus" && generationOf >= 4.7)
+            ? { display: "summarized" }
+            : {}),
+    };
+
+    if (family === "haiku") {
+        return { high: { thinking }, max: { thinking } };
+    }
+
+    const supportsXhigh =
+        isMythos ||
+        (family === "opus" ? generationOf >= 4.6 : generationOf >= 5);
+    const efforts = supportsXhigh ? CLAUDE_EFFORTS_XHIGH : CLAUDE_EFFORTS_BASE;
     return Object.fromEntries(
         efforts.map((effort) => [
             effort,
-            {
-                thinking: {
-                    type: "adaptive",
-                    // opus-4-7 specific: summarized display reduces token
-                    // overhead of reasoning traces in multi-turn contexts.
-                    ...(isOpus47 ? { display: "summarized" } : {}),
-                },
-                effort,
-            },
+            { thinking, output_config: { effort } },
         ]),
     );
 }
