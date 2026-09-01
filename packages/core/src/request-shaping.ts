@@ -228,13 +228,24 @@ export function scrubBedrockToolFields(body: unknown): unknown {
 // rather than making callers know which models are sampling-locked.
 const NO_TEMPERATURE = /gpt.?5\.6/i;
 
+// Claude 5 opus/sonnet accept only temperature=1: "does not support
+// temperature=0.7. Only temperature=1 is supported." Claude 4.6 and 4.5 take
+// any value, so pin rather than drop — dropping would silently change sampling
+// on a model that does honor the field.
+const FIXED_TEMPERATURE_1 =
+    /claude.*(opus|sonnet).*5(?![._-]?\d)|claude.*5.*(opus|sonnet)/i;
+
 export function scrubUnsupportedSamplingFields(body: unknown): unknown {
     if (!body || typeof body !== "object") return body;
     const obj = body as Record<string, unknown>;
-    if (typeof obj.model === "string" && NO_TEMPERATURE.test(obj.model)) {
+    const model = typeof obj.model === "string" ? obj.model : "";
+    if (NO_TEMPERATURE.test(model)) {
         if ("temperature" in obj) delete obj.temperature;
         if ("top_p" in obj) delete obj.top_p;
         return obj;
+    }
+    if (FIXED_TEMPERATURE_1.test(model) && "temperature" in obj) {
+        obj.temperature = 1;
     }
     // Bedrock: "`temperature` and `top_p` cannot both be specified for this
     // model. Please use only one." Keep temperature, the more common knob.

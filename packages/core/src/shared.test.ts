@@ -272,6 +272,21 @@ describe("shapeBedrockRequestBody", () => {
         expect("top_p" in out).toBe(false);
     });
 
+    it("pins temperature to 1 for claude 5, which accepts nothing else", () => {
+        const pinned = shapeBedrockRequestBody({
+            model: "bedrock-claude-5-opus",
+            messages: [{ role: "user", content: "hi" }],
+            temperature: 0.7,
+        });
+        expect(pinned.temperature).toBe(1);
+        const untouched = shapeBedrockRequestBody({
+            model: "bedrock-claude-4-6-sonnet",
+            messages: [{ role: "user", content: "hi" }],
+            temperature: 0.7,
+        });
+        expect(untouched.temperature).toBe(0.7);
+    });
+
     it("keeps temperature but drops top_p when a model gets both", () => {
         const out = shapeBedrockRequestBody({
             model: "bedrock-claude-4-6-sonnet",
