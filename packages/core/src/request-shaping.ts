@@ -222,6 +222,26 @@ export function scrubBedrockToolFields(body: unknown): unknown {
     return obj;
 }
 
+// gpt-5.6 (sol/luna/terra) hard-rejects `temperature`: "This model doesn't
+// support the temperature field. Remove temperature and try again." Every other
+// model on this deployment accepts it (verified live), so drop it only here
+// rather than making callers know which models are sampling-locked.
+const NO_TEMPERATURE = /gpt.?5\.6/i;
+
+export function scrubUnsupportedSamplingFields(body: unknown): unknown {
+    if (!body || typeof body !== "object") return body;
+    const obj = body as Record<string, unknown>;
+    if (typeof obj.model === "string" && NO_TEMPERATURE.test(obj.model)) {
+        if ("temperature" in obj) delete obj.temperature;
+        if ("top_p" in obj) delete obj.top_p;
+        return obj;
+    }
+    // Bedrock: "`temperature` and `top_p` cannot both be specified for this
+    // model. Please use only one." Keep temperature, the more common knob.
+    if ("temperature" in obj && "top_p" in obj) delete obj.top_p;
+    return obj;
+}
+
 /**
  * Apply the full Bedrock-safety pass to a parsed request body, in place.
  * Order matters: repair dangling tool calls first so the synthesized replies are
@@ -233,6 +253,7 @@ export function shapeBedrockRequestBody(
 ): Record<string, unknown> {
     repairDanglingToolCalls(body);
     scrubBedrockToolFields(body);
+    scrubUnsupportedSamplingFields(body);
     sanitizeBedrockContent(body);
     return body;
 }

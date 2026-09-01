@@ -291,8 +291,9 @@ async function consumeSse(
         while (true) {
             const { done, value } = await reader.read();
             if (done) break;
-            buffer += decoder.decode(value, { stream: true });
-            usageBuffer += decoder.decode(value, { stream: true });
+            const text = decoder.decode(value, { stream: true });
+            buffer += text;
+            usageBuffer += text;
             if (usageBuffer.length > 8192) usageBuffer = usageBuffer.slice(-8192);
 
             let nl: number;

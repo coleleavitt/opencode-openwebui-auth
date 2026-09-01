@@ -260,6 +260,28 @@ describe("shapeBedrockRequestBody", () => {
         // Bedrock rejects the tool history for having no `tools` declared.
         expect(Array.isArray(out.tools)).toBe(true);
     });
+
+    it("drops temperature/top_p for gpt-5.6, which rejects both", () => {
+        const out = shapeBedrockRequestBody({
+            model: "openai.gpt-5.6-sol",
+            messages: [{ role: "user", content: "hi" }],
+            temperature: 0.5,
+            top_p: 0.9,
+        });
+        expect("temperature" in out).toBe(false);
+        expect("top_p" in out).toBe(false);
+    });
+
+    it("keeps temperature but drops top_p when a model gets both", () => {
+        const out = shapeBedrockRequestBody({
+            model: "bedrock-claude-4-6-sonnet",
+            messages: [{ role: "user", content: "hi" }],
+            temperature: 0.5,
+            top_p: 0.9,
+        });
+        expect(out.temperature).toBe(0.5);
+        expect("top_p" in out).toBe(false);
+    });
 });
 
 describe("parseUsageFromBuffer", () => {

@@ -30,6 +30,8 @@ export const RETRYABLE_BODY_PATTERNS = [
     "MidStreamFallbackError",
     "modelTimeoutException",
     "modelStreamErrorException",
+    // OWUI's own proxy layer failing to reach LiteLLM, also surfaced as a 400.
+    "Open WebUI: Server Connection Error",
 ];
 
 /** True when a 400 body is really a transient Bedrock error LiteLLM mislabeled. */
