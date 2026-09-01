@@ -59,15 +59,6 @@ const OWUI_SENSITIVE_HEADERS = new Set([
     "anthropic-beta",
 ]);
 
-const DUMMY_TOOL = {
-    type: "function",
-    function: {
-        name: "dummy_tool",
-        description: "placeholder tool — never call",
-        parameters: { type: "object", properties: {} },
-    },
-};
-
 // Bedrock request-shaping and Retry-After parsing live in core; re-exported here
 // so existing imports and tests that reference them via ./fetch keep working.
 export {
@@ -141,7 +132,7 @@ function buildHeaders(
     const headers = new Headers();
     if (init?.headers) {
         if (init.headers instanceof Headers) {
-            init.headers.forEach((value, key) => headers.set(key, value));
+            for (const [key, value] of init.headers) headers.set(key, value);
         } else if (Array.isArray(init.headers)) {
             for (const [key, value] of init.headers) {
                 if (value !== undefined) headers.set(key, String(value));
@@ -540,6 +531,11 @@ export function makeOwuiFetch(storage: Storage) {
             }
             return res;
         }
-        return lastRes!;
+        // Every iteration assigns lastRes before it can continue, and the loop
+        // always runs at least once, so this is unreachable — but throwing beats
+        // asserting: if the loop is ever restructured, this fails loudly instead
+        // of returning undefined as a Response.
+        if (!lastRes) throw new Error("retry loop exited without a response");
+        return lastRes;
     };
 }
