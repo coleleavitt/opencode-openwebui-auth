@@ -21,6 +21,7 @@ import {
     type SimpleStreamOptions,
     type StopReason,
     type TextContent,
+    type ThinkingContent,
     type ToolCall,
 } from "@earendil-works/pi-ai";
 
@@ -28,9 +29,17 @@ import { buildOpenAIRequest } from "./convert";
 
 const SAFETY_TIMEOUT_MS = 10 * 60 * 1000;
 
+/** Reasoning delta field names, most specific first; the first match wins. */
+const REASONING_FIELDS = ["reasoning_content", "reasoning", "reasoning_text"] as const;
+
 interface OpenAIStreamDelta {
     role?: string;
     content?: string | null;
+    // LiteLLM/Bedrock returns the reasoning trace out-of-band from `content`.
+    // Field name varies by upstream, so all three known spellings are read.
+    reasoning_content?: string | null;
+    reasoning?: string | null;
+    reasoning_text?: string | null;
     tool_calls?: Array<{
         index: number;
         id?: string;
@@ -277,7 +286,22 @@ async function consumeSse(
     let finishReason: StopReason = "stop";
 
     let textIndex = -1;
+    let thinkingIndex = -1;
     const toolCalls = new Map<number, ToolCallAccumulator>();
+
+    // The trace arrives before the answer, so its block is opened first and the
+    // signature records which upstream field supplied it (round-trip fidelity).
+    const ensureThinkingBlock = (signature: string) => {
+        if (thinkingIndex === -1) {
+            output.content.push({
+                type: "thinking",
+                thinking: "",
+                thinkingSignature: signature,
+            } as ThinkingContent);
+            thinkingIndex = output.content.length - 1;
+            stream.push({ type: "thinking_start", contentIndex: thinkingIndex, partial: output });
+        }
+    };
 
     const ensureTextBlock = () => {
         if (textIndex === -1) {
@@ -320,6 +344,20 @@ async function consumeSse(
                 const choice = chunk.choices?.[0];
                 if (!choice) continue;
                 const delta = choice.delta ?? {};
+
+                for (const field of REASONING_FIELDS) {
+                    const reasoning = delta[field];
+                    if (typeof reasoning !== "string" || reasoning.length === 0) continue;
+                    ensureThinkingBlock(field);
+                    (output.content[thinkingIndex] as ThinkingContent).thinking += reasoning;
+                    stream.push({
+                        type: "thinking_delta",
+                        contentIndex: thinkingIndex,
+                        delta: reasoning,
+                        partial: output,
+                    });
+                    break;
+                }
 
                 if (typeof delta.content === "string" && delta.content.length > 0) {
                     ensureTextBlock();
@@ -375,7 +413,11 @@ async function consumeSse(
         reader.releaseLock();
     }
 
-    // Finalize text + tool-call blocks.
+    // Finalize thinking + text + tool-call blocks.
+    if (thinkingIndex !== -1) {
+        const thinking = (output.content[thinkingIndex] as ThinkingContent).thinking;
+        stream.push({ type: "thinking_end", contentIndex: thinkingIndex, content: thinking, partial: output });
+    }
     if (textIndex !== -1) {
         const content = (output.content[textIndex] as TextContent).text;
         stream.push({ type: "text_end", contentIndex: textIndex, content, partial: output });
