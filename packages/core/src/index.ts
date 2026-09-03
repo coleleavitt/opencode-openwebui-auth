@@ -2,6 +2,7 @@
 // Consumed by the opencode plugin and the pi extension adapters.
 export * from "./types";
 export * from "./logger";
+export * from "./model-cache";
 export * from "./pricing";
 export * from "./storage";
 export * from "./oauth/api";

@@ -14,9 +14,10 @@ openwebui-auth/
     │   └── src/
     │       ├── index.ts        # public barrel
     │       ├── types.ts        # account / model / config / JWT types
-    │       ├── logger.ts       # log/logAuth/logRequest/logResponse
+    │       ├── logger.ts       # log/logAuth/logRequest/logResponse (0600, no symlink follow)
     │       ├── pricing.ts      # per-model cost inference + accounting
-    │       ├── storage.ts      # Storage: JSON account store + usage
+    │       ├── storage.ts      # Storage: JSON account store + usage (cross-process locked)
+    │       ├── model-cache.ts  # ModelCatalogCache: last-known-good model list
     │       ├── request-shaping.ts  # Bedrock-safe body: sanitize*/scrubBedrockToolFields
     │       ├── retry-policy.ts      # retry statuses, Retry-After, backoff, refresh skew
     │       ├── usage-parse.ts       # parseUsageFromBuffer (OpenAI SSE usage)

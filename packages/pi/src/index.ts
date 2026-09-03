@@ -1,20 +1,22 @@
-import {
-    fetchInstanceConfig,
-    inferModelLimits,
-    listModels,
-    log,
-    normalizeBaseUrl,
-    oidcLogin,
-    type OpenWebUIModelInfo,
-    parseJwtClaims,
-    Storage,
-    verifyToken,
-} from "@openwebui-auth/core";
 import type {
     OAuthCredentials,
     OAuthLoginCallbacks,
 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+    fetchInstanceConfig,
+    inferModelLimits,
+    listModels,
+    log,
+    ModelCatalogCache,
+    normalizeBaseUrl,
+    type OpenWebUIAccount,
+    type OpenWebUIModelInfo,
+    oidcLogin,
+    parseJwtClaims,
+    Storage,
+    verifyToken,
+} from "@openwebui-auth/core";
 
 import { streamOpenWebUI } from "./stream";
 
@@ -155,25 +157,62 @@ function toPiModel(baseUrl: string, raw: OpenWebUIModelInfo) {
     };
 }
 
-/** Fetch the live model catalog for the current account, if one exists. */
-export async function resolvePiModelCatalog() {
-    const baseUrl = envBaseUrl();
-    const account = new Storage().getCurrent();
+type PiModel = ReturnType<typeof toPiModel>;
+
+/** Injection seams so catalog behaviour is testable without a network or a store. */
+export interface ModelCatalogDeps {
+    cache?: ModelCatalogCache<PiModel>;
+    getAccount?: () => OpenWebUIAccount | undefined;
+    fetchModels?: (
+        baseUrl: string,
+        token: string,
+    ) => Promise<{ data: OpenWebUIModelInfo[] }>;
+}
+
+/**
+ * Fetch the live model catalog for the current account.
+ *
+ * Discovery runs while the agent starts, so a network failure must not empty
+ * the model list: fall back to the last catalog seen for the same host.
+ */
+export async function resolvePiModelCatalog(
+    deps: ModelCatalogDeps = {},
+): Promise<PiModel[]> {
+    const cache = deps.cache ?? new ModelCatalogCache<PiModel>();
+    const account = (deps.getAccount ?? (() => new Storage().getCurrent()))();
     if (!account) return [];
+    const fetchModels = deps.fetchModels ?? listModels;
+
     try {
-        const { data } = await listModels(account.baseUrl, account.token);
-        return data.map((m) => toPiModel(account.baseUrl, m));
+        const { data } = await fetchModels(account.baseUrl, account.token);
+        const models = data.map((m) => toPiModel(account.baseUrl, m));
+        if (models.length > 0) {
+            cache.save(account.baseUrl, models);
+            return models;
+        }
+        log("[pi] model discovery returned no models");
     } catch (err) {
         log(
             `[pi] model discovery failed: ${err instanceof Error ? err.message : err}`,
         );
-        return [];
     }
+
+    const cached = cache.load(account.baseUrl);
+    if (!cached) return [];
+    const ageMinutes = Math.round((Date.now() - cached.fetchedAt) / 60_000);
+    log(
+        `[pi] serving ${cached.models.length} cached models for ${account.baseUrl} (${ageMinutes}m old)`,
+    );
+    return cached.models;
 }
 
 export default async function openWebUiPiAuth(pi: ExtensionAPI) {
-    const baseUrl = envBaseUrl();
     const models = await resolvePiModelCatalog();
+    // The provider must advertise the host the models and the stream actually
+    // use. The env default is only a fallback for a first-time login, so a
+    // stored account whose host differs no longer leaves the provider record
+    // pointing somewhere the requests never go.
+    const baseUrl = new Storage().getCurrent()?.baseUrl ?? envBaseUrl();
 
     pi.registerProvider("openwebui", {
         name: "OpenWebUI (Shibboleth OIDC)",
