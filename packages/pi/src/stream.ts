@@ -1,4 +1,18 @@
 import {
+    type Api,
+    type AssistantMessage,
+    type AssistantMessageEventStream,
+    type Context,
+    calculateCost,
+    createAssistantMessageEventStream,
+    type Model,
+    type SimpleStreamOptions,
+    type StopReason,
+    type TextContent,
+    type ThinkingContent,
+    type ToolCall,
+} from "@earendil-works/pi-ai";
+import {
     AUTH_RETRY_STATUSES,
     isRetryableErrorBody,
     log,
@@ -10,27 +24,17 @@ import {
     RETRY_STATUSES,
     Storage,
 } from "@openwebui-auth/core";
-import {
-    type Api,
-    type AssistantMessage,
-    type AssistantMessageEventStream,
-    calculateCost,
-    type Context,
-    createAssistantMessageEventStream,
-    type Model,
-    type SimpleStreamOptions,
-    type StopReason,
-    type TextContent,
-    type ThinkingContent,
-    type ToolCall,
-} from "@earendil-works/pi-ai";
 
 import { buildOpenAIRequest } from "./convert";
 
 const SAFETY_TIMEOUT_MS = 10 * 60 * 1000;
 
 /** Reasoning delta field names, most specific first; the first match wins. */
-const REASONING_FIELDS = ["reasoning_content", "reasoning", "reasoning_text"] as const;
+const REASONING_FIELDS = [
+    "reasoning_content",
+    "reasoning",
+    "reasoning_text",
+] as const;
 
 interface OpenAIStreamDelta {
     role?: string;
@@ -99,7 +103,13 @@ export function streamOpenWebUI(
                 cacheRead: 0,
                 cacheWrite: 0,
                 totalTokens: 0,
-                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+                cost: {
+                    input: 0,
+                    output: 0,
+                    cacheRead: 0,
+                    cacheWrite: 0,
+                    total: 0,
+                },
             },
             stopReason: "pending",
             timestamp: Date.now(),
@@ -108,7 +118,10 @@ export function streamOpenWebUI(
         const storage = new Storage();
         let account = storage.getCurrent();
         let token = options?.apiKey ?? account?.token ?? "";
-        const baseUrl = (account?.baseUrl ?? model.baseUrl).replace(/\/api$/, "");
+        const baseUrl = (account?.baseUrl ?? model.baseUrl).replace(
+            /\/api$/,
+            "",
+        );
         const url = `${baseUrl}/api/chat/completions`;
 
         const body = buildOpenAIRequest(model.id, context, {
@@ -137,7 +150,9 @@ export function streamOpenWebUI(
                         res.headers.get("x-should-retry"),
                     );
                     if (delay !== undefined) {
-                        log(`[pi-stream] retry #${attempt} in ${Math.round(delay)}ms after ${res.status}`);
+                        log(
+                            `[pi-stream] retry #${attempt} in ${Math.round(delay)}ms after ${res.status}`,
+                        );
                         await new Promise((r) => setTimeout(r, delay));
                     }
                 }
@@ -159,7 +174,9 @@ export function streamOpenWebUI(
                 // 401/403 -> re-auth once via OIDC (needs env credentials).
                 if (AUTH_RETRY_STATUSES.has(res.status) && !didAuthRetry) {
                     didAuthRetry = true;
-                    const refreshed = await reauth(baseUrl).catch(() => undefined);
+                    const refreshed = await reauth(baseUrl).catch(
+                        () => undefined,
+                    );
                     if (refreshed) {
                         token = refreshed;
                         account = storage.getCurrent();
@@ -183,14 +200,21 @@ export function streamOpenWebUI(
                 if (!retryable || attempt >= MAX_RETRIES) break;
             }
 
-            if (!res || !res.ok || !res.body) {
-                const detail = res ? `${res.status} ${await peekBody(res)}` : "no response";
+            if (!res?.ok || !res.body) {
+                const detail = res
+                    ? `${res.status} ${await peekBody(res)}`
+                    : "no response";
                 throw new Error(`OpenWebUI request failed: ${detail}`);
             }
 
             stream.push({ type: "start", partial: output });
 
-            const finishReason = await consumeSse(res.body, stream, output, model);
+            const finishReason = await consumeSse(
+                res.body,
+                stream,
+                output,
+                model,
+            );
 
             // Account usage into the shared store (best effort).
             if (account && output.usage.totalTokens > 0) {
@@ -220,10 +244,14 @@ export function streamOpenWebUI(
                 err instanceof Error &&
                 (err.name === "AbortError" || err.message.includes("aborted"));
             output.stopReason = aborted ? "aborted" : "error";
-            output.errorMessage = err instanceof Error ? err.message : String(err);
+            output.errorMessage =
+                err instanceof Error ? err.message : String(err);
             stream.push({
                 type: "error",
-                reason: output.stopReason as Extract<StopReason, "aborted" | "error">,
+                reason: output.stopReason as Extract<
+                    StopReason,
+                    "aborted" | "error"
+                >,
                 error: output,
             });
             stream.end(output);
@@ -247,7 +275,9 @@ async function reauth(baseUrl: string): Promise<string> {
     const username = process.env.OWUI_USERNAME?.trim();
     const password = process.env.OWUI_PASSWORD;
     if (!username || !password) {
-        throw new Error("token expired and no OWUI_USERNAME/OWUI_PASSWORD for re-auth");
+        throw new Error(
+            "token expired and no OWUI_USERNAME/OWUI_PASSWORD for re-auth",
+        );
     }
     const result = await oidcLogin({
         baseUrl,
@@ -299,7 +329,11 @@ async function consumeSse(
                 thinkingSignature: signature,
             } as ThinkingContent);
             thinkingIndex = output.content.length - 1;
-            stream.push({ type: "thinking_start", contentIndex: thinkingIndex, partial: output });
+            stream.push({
+                type: "thinking_start",
+                contentIndex: thinkingIndex,
+                partial: output,
+            });
         }
     };
 
@@ -307,7 +341,11 @@ async function consumeSse(
         if (textIndex === -1) {
             output.content.push({ type: "text", text: "" } as TextContent);
             textIndex = output.content.length - 1;
-            stream.push({ type: "text_start", contentIndex: textIndex, partial: output });
+            stream.push({
+                type: "text_start",
+                contentIndex: textIndex,
+                partial: output,
+            });
         }
     };
 
@@ -318,7 +356,8 @@ async function consumeSse(
             const text = decoder.decode(value, { stream: true });
             buffer += text;
             usageBuffer += text;
-            if (usageBuffer.length > 8192) usageBuffer = usageBuffer.slice(-8192);
+            if (usageBuffer.length > 8192)
+                usageBuffer = usageBuffer.slice(-8192);
 
             let nl: number;
             // biome-ignore lint/suspicious/noAssignInExpressions: SSE line split
@@ -347,9 +386,12 @@ async function consumeSse(
 
                 for (const field of REASONING_FIELDS) {
                     const reasoning = delta[field];
-                    if (typeof reasoning !== "string" || reasoning.length === 0) continue;
+                    if (typeof reasoning !== "string" || reasoning.length === 0)
+                        continue;
                     ensureThinkingBlock(field);
-                    (output.content[thinkingIndex] as ThinkingContent).thinking += reasoning;
+                    (
+                        output.content[thinkingIndex] as ThinkingContent
+                    ).thinking += reasoning;
                     stream.push({
                         type: "thinking_delta",
                         contentIndex: thinkingIndex,
@@ -359,9 +401,13 @@ async function consumeSse(
                     break;
                 }
 
-                if (typeof delta.content === "string" && delta.content.length > 0) {
+                if (
+                    typeof delta.content === "string" &&
+                    delta.content.length > 0
+                ) {
                     ensureTextBlock();
-                    (output.content[textIndex] as TextContent).text += delta.content;
+                    (output.content[textIndex] as TextContent).text +=
+                        delta.content;
                     stream.push({
                         type: "text_delta",
                         contentIndex: textIndex,
@@ -415,12 +461,23 @@ async function consumeSse(
 
     // Finalize thinking + text + tool-call blocks.
     if (thinkingIndex !== -1) {
-        const thinking = (output.content[thinkingIndex] as ThinkingContent).thinking;
-        stream.push({ type: "thinking_end", contentIndex: thinkingIndex, content: thinking, partial: output });
+        const thinking = (output.content[thinkingIndex] as ThinkingContent)
+            .thinking;
+        stream.push({
+            type: "thinking_end",
+            contentIndex: thinkingIndex,
+            content: thinking,
+            partial: output,
+        });
     }
     if (textIndex !== -1) {
         const content = (output.content[textIndex] as TextContent).text;
-        stream.push({ type: "text_end", contentIndex: textIndex, content, partial: output });
+        stream.push({
+            type: "text_end",
+            contentIndex: textIndex,
+            content,
+            partial: output,
+        });
     }
     for (const acc of toolCalls.values()) {
         let args: Record<string, unknown> = {};

@@ -20,8 +20,8 @@ import {
     renameSync,
     writeFileSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
 import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import { log } from "../logger";
 
 /* ------------------------------------------------------------------ */
@@ -55,8 +55,11 @@ class CookieJar {
     /** Parse Set-Cookie headers and store per-domain */
     capture(url: string, headers: Headers): void {
         const domain = new URL(url).hostname;
-        if (!this.cookies.has(domain)) this.cookies.set(domain, new Map());
-        const jar = this.cookies.get(domain)!;
+        let jar = this.cookies.get(domain);
+        if (!jar) {
+            jar = new Map();
+            this.cookies.set(domain, jar);
+        }
 
         for (const raw of headers.getSetCookie?.() ?? []) {
             const [pair] = raw.split(";");
@@ -281,8 +284,7 @@ function extractFormAction(html: string, url: string): string | undefined {
 function extractHiddenFields(html: string): Record<string, string> {
     const fields: Record<string, string> = {};
     const re = /<input[^>]*type="hidden"[^>]*>/gi;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(html)) !== null) {
+    for (let m = re.exec(html); m !== null; m = re.exec(html)) {
         const nameMatch = m[0].match(/name="([^"]+)"/);
         const valueMatch = m[0].match(/value="([^"]*)"/);
         if (nameMatch) {
@@ -306,7 +308,7 @@ async function step1_initiateOidc(
     baseUrl: string,
 ): Promise<string> {
     log("[oidc] Step 1: Initiating OIDC login");
-    const { res, url: finalUrl } = await followRedirects(
+    const { url: finalUrl } = await followRedirects(
         jar,
         `${baseUrl}/oauth/oidc/login`,
     );
@@ -346,19 +348,18 @@ async function step2_submitCredentials(
         throw new Error("Step 2a: Could not find e1s1 form action");
 
     const probeFields = extractHiddenFields(probeHtml);
-    probeFields["shib_idp_ls_supported"] = "true";
+    probeFields.shib_idp_ls_supported = "true";
     probeFields["shib_idp_ls_success.shib_idp_session_ss"] = "true";
     probeFields["shib_idp_ls_success.shib_idp_persistent_ss"] = "true";
-    if (!("_eventId_proceed" in probeFields))
-        probeFields["_eventId_proceed"] = "";
+    if (!("_eventId_proceed" in probeFields)) probeFields._eventId_proceed = "";
 
     log(`[oidc] Step 2a: Submitting localStorage probe → ${probeAction}`);
     const probeRes = await followRedirects(jar, probeAction, {
         body: new URLSearchParams(probeFields).toString(),
     });
 
-    let loginHtml = probeRes.body;
-    let loginUrl = probeRes.url;
+    const loginHtml = probeRes.body;
+    const loginUrl = probeRes.url;
     log(`[oidc] Step 2a: Advanced to ${loginUrl}`);
 
     // If Shibboleth session is still alive, it skips the login form entirely
@@ -499,7 +500,7 @@ async function step3_navigateToDuo(
         const execMatch = url.match(/execution=e(\d+)s(\d+)/);
         if (execMatch) {
             const flow = execMatch[1];
-            const step = Number.parseInt(execMatch[2]) + 1;
+            const step = Number.parseInt(execMatch[2], 10) + 1;
             const nextUrl = url.replace(
                 /execution=e\d+s\d+/,
                 `execution=e${flow}s${step}`,
@@ -628,7 +629,7 @@ async function postExpectRedirect(
     if (res.status < 300 || res.status >= 400) {
         throw new Error(`${label}: expected 3xx, got ${res.status}`);
     }
-    if (!loc || !loc.includes(locationMustInclude)) {
+    if (!loc?.includes(locationMustInclude)) {
         throw new Error(
             `${label}: expected Location containing "${locationMustInclude}", got "${loc ?? "(none)"}"`,
         );
@@ -1021,7 +1022,7 @@ async function step4_completeDuo(
     });
     const exitLocation = exitRes.headers.get("location");
     await exitRes.text().catch(() => {});
-    if (!exitLocation || !exitLocation.includes("duo-callback")) {
+    if (!exitLocation?.includes("duo-callback")) {
         throw new Error(
             `Step 4j: expected duo-callback redirect, got status=${exitRes.status} loc=${exitLocation ?? "(none)"}`,
         );

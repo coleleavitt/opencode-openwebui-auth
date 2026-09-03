@@ -1,4 +1,3 @@
-import { shapeBedrockRequestBody } from "@openwebui-auth/core";
 import type {
     Context,
     ImageContent,
@@ -9,6 +8,7 @@ import type {
     ToolCall,
     ToolResultMessage,
 } from "@earendil-works/pi-ai";
+import { shapeBedrockRequestBody } from "@openwebui-auth/core";
 
 /** An OpenAI chat/completions request body (the subset we build). */
 export interface OpenAIChatRequest {
@@ -157,7 +157,8 @@ export function buildOpenAIRequest(
         stream: true,
         stream_options: { include_usage: true },
     };
-    if (typeof options.maxTokens === "number") body.max_tokens = options.maxTokens;
+    if (typeof options.maxTokens === "number")
+        body.max_tokens = options.maxTokens;
     if (typeof options.temperature === "number") {
         body.temperature = options.temperature;
     }

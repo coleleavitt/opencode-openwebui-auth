@@ -6,12 +6,16 @@ import { ModelCatalogCache, type OpenWebUIAccount } from "@openwebui-auth/core";
 
 import { resolvePiModelCatalog } from "./index";
 
+type CachedPiModel = Awaited<ReturnType<typeof resolvePiModelCatalog>>[number];
+
 const dirs: string[] = [];
 
 function tempCache() {
     const dir = mkdtempSync(join(tmpdir(), "owui-pi-models-"));
     dirs.push(dir);
-    return new ModelCatalogCache<any>(join(dir, "openwebui-models.json"));
+    return new ModelCatalogCache<CachedPiModel>(
+        join(dir, "openwebui-models.json"),
+    );
 }
 
 const ACCOUNT: OpenWebUIAccount = {

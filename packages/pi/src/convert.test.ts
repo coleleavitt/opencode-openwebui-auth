@@ -63,7 +63,9 @@ describe("buildOpenAIRequest", () => {
             }),
         );
         const msg = req.messages[0] as {
-            tool_calls: Array<{ function: { name: string; arguments: string } }>;
+            tool_calls: Array<{
+                function: { name: string; arguments: string };
+            }>;
         };
         expect(msg.tool_calls[0].function.name).toBe("read");
         expect(JSON.parse(msg.tool_calls[0].function.arguments)).toEqual({
@@ -96,7 +98,9 @@ describe("buildOpenAIRequest", () => {
         const req = buildOpenAIRequest(
             "m",
             ctx({
-                messages: [{ role: "user", content: "x", timestamp: 0 } as never],
+                messages: [
+                    { role: "user", content: "x", timestamp: 0 } as never,
+                ],
                 tools: [
                     {
                         name: "read",
@@ -131,7 +135,8 @@ describe("buildOpenAIRequest", () => {
             );
             expect(req.reasoning_effort).toBe("high");
         } finally {
-            if (prev === undefined) delete process.env.OWUI_SEND_REASONING_EFFORT;
+            if (prev === undefined)
+                delete process.env.OWUI_SEND_REASONING_EFFORT;
             else process.env.OWUI_SEND_REASONING_EFFORT = prev;
         }
     });
@@ -140,7 +145,9 @@ describe("buildOpenAIRequest", () => {
         const req = buildOpenAIRequest(
             "m",
             ctx({
-                messages: [{ role: "user", content: "   ", timestamp: 0 } as never],
+                messages: [
+                    { role: "user", content: "   ", timestamp: 0 } as never,
+                ],
             }),
         );
         expect(req.messages[0]).toEqual({ role: "user", content: "." });
