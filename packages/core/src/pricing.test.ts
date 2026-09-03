@@ -130,6 +130,7 @@ describe("resolveModelPricing — models this deployment actually serves", () =>
         ["bedrock-claude-4-6-sonnet", "bedrock-sonnet", 3, 15],
         ["bedrock-claude-4-5-haiku", "bedrock-haiku", 1, 5],
         ["bedrock-nova-pro-v1", "nova-pro", 0.8, 3.2],
+        ["google.gemma-4-31b", "gemma-4-31b", 0.09, 0.34],
         [
             "meta.llama4-maverick-17b-instruct-v1:0",
             "llama4-maverick",
@@ -167,10 +168,27 @@ describe("resolveModelPricing — models this deployment actually serves", () =>
     });
 
     test("an unmatched model is reported as unknown, not as free", () => {
-        const resolved = resolveModelPricing("google.gemma-4-31b");
+        const resolved = resolveModelPricing("some-unlisted-model-v9");
         expect(resolved.known).toBe(false);
         expect(resolved.label).toBe("unknown");
         expect(resolved.pricing.inputPerMTok).toBe(0);
+    });
+
+    test("Gemma 4 31B bills at the baseline managed-API rate", () => {
+        const resolved = resolveModelPricing("google.gemma-4-31b");
+        expect(resolved.known).toBe(true);
+        expect(resolved.pricing.cacheReadPerMTok).toBe(0.01);
+        expect(
+            computeUsageCost(
+                {
+                    input: 1_000_000,
+                    output: 1_000_000,
+                    cacheRead: 0,
+                    cacheWrite: 0,
+                },
+                resolved.pricing,
+            ),
+        ).toBe(0.43);
     });
 
     test("undefined and unrelated ids stay unknown", () => {

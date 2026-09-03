@@ -79,6 +79,15 @@ const LLAMA4_MAVERICK: ModelPricing = {
     cacheReadPerMTok: 0,
     cacheWritePerMTok: 0,
 };
+// Gemma 4 31B is Apache-2.0 open weights, so there is no single vendor price.
+// These are the baseline managed-API rates; a self-hosted deployment bills
+// nothing per token, and other gateways charge several times the input rate.
+const GEMMA_4_31B: ModelPricing = {
+    inputPerMTok: 0.09,
+    outputPerMTok: 0.34,
+    cacheReadPerMTok: 0.01,
+    cacheWritePerMTok: 0,
+};
 
 export const UNKNOWN_PRICING: ModelPricing = {
     inputPerMTok: 0,
@@ -113,6 +122,11 @@ const PRICING_RULES: {
         pricing: BEDROCK_HAIKU,
     },
     { label: "nova-pro", pattern: /nova[-_]?pro/i, pricing: NOVA_PRO },
+    {
+        label: "gemma-4-31b",
+        pattern: /gemma[-_.]?4[-_.]?31b/i,
+        pricing: GEMMA_4_31B,
+    },
     {
         label: "llama4-maverick",
         pattern: /llama[-_]?4.*maverick/i,

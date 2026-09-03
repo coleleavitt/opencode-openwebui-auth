@@ -63,7 +63,9 @@ describe("Storage persistence", () => {
         });
 
         const before = storage.getCurrent();
-        await storage.upsert({ ...before!, token: "rotated", updatedAt: 2 });
+        expect(before).toBeDefined();
+        if (!before) throw new Error("account missing");
+        await storage.upsert({ ...before, token: "rotated", updatedAt: 2 });
 
         const after = storage.getCurrent();
         expect(after?.token).toBe("rotated");
@@ -118,13 +120,15 @@ describe("Storage persistence", () => {
             output: 1_000_000,
             cacheRead: 0,
             cacheWrite: 0,
-            model: "google.gemma-4-31b",
+            model: "some-unlisted-model-v9",
         });
 
         const total = storage.getCurrent()?.totalUsage;
         expect(total?.inputTokens).toBe(1_000_000);
         expect(total?.costUsd).toBe(0);
-        expect(total?.byModel?.["google.gemma-4-31b"]?.requestCount).toBe(1);
+        expect(total?.byModel?.["some-unlisted-model-v9"]?.requestCount).toBe(
+            1,
+        );
     });
 });
 
