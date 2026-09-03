@@ -1,28 +1,115 @@
-import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync } from "node:fs";
-import { dirname, join } from "node:path";
+import {
+    existsSync,
+    mkdirSync,
+    readFileSync,
+    renameSync,
+    rmSync,
+    statSync,
+    writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
-import type { OpenWebUIAccount, OpenWebUIStore, PerModelUsage } from "./types";
+import { dirname, join } from "node:path";
 import { log } from "./logger";
-import { computeUsageCost, getModelPricing, normalizeModelKey } from "./pricing";
+import {
+    computeUsageCost,
+    normalizeModelKey,
+    resolveModelPricing,
+} from "./pricing";
+import type { OpenWebUIAccount, OpenWebUIStore, PerModelUsage } from "./types";
 
-const STORE_PATH = join(homedir(), ".config", "opencode", "openwebui-accounts.json");
+const STORE_PATH = join(
+    homedir(),
+    ".config",
+    "opencode",
+    "openwebui-accounts.json",
+);
 
 const EMPTY: OpenWebUIStore = { version: 1, accounts: {} };
 
+/**
+ * Cross-process mutual exclusion for the shared store.
+ *
+ * The pi extension, the opencode plugin and the CLI all read-modify-write one
+ * JSON file, so an in-process promise chain is not enough: two processes can
+ * both load, both mutate, and the second save silently discards the first
+ * (a lost token rotation, or lost usage counters). `mkdir` is atomic on every
+ * supported filesystem, so the directory itself is the lock.
+ */
+const LOCK_STALE_MS = 10_000;
+const LOCK_RETRY_MS = 25;
+const LOCK_TIMEOUT_MS = 5_000;
+
+function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export async function acquireStoreLock(lockPath: string): Promise<() => void> {
+    const release = () => {
+        try {
+            rmSync(lockPath, { recursive: true, force: true });
+        } catch {}
+    };
+    const deadline = Date.now() + LOCK_TIMEOUT_MS;
+    for (;;) {
+        try {
+            mkdirSync(lockPath);
+            return release;
+        } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+            try {
+                if (Date.now() - statSync(lockPath).mtimeMs > LOCK_STALE_MS) {
+                    log(`[storage] breaking a stale lock at ${lockPath}`);
+                    rmSync(lockPath, { recursive: true, force: true });
+                    continue;
+                }
+            } catch {}
+            if (Date.now() >= deadline) {
+                // Never fail a request over bookkeeping: proceed unlocked, but
+                // say so, because this is the one path that can still lose data.
+                log(
+                    `[storage] lock still held after ${LOCK_TIMEOUT_MS}ms; writing unlocked`,
+                );
+                return () => {};
+            }
+            await sleep(LOCK_RETRY_MS);
+        }
+    }
+}
+
+const unknownPricingReported = new Set<string>();
+
 export class Storage {
     private path: string;
+    private lockPath: string;
     private writeChain: Promise<void> = Promise.resolve();
 
     constructor(path: string = STORE_PATH) {
         this.path = path;
+        this.lockPath = `${path}.lock`;
     }
 
+    /**
+     * Serialize a read-modify-write both in-process (the chain) and across
+     * processes (the lock). The whole load/mutate/save cycle runs inside the
+     * critical section, not just the save.
+     */
     private enqueueWrite<T>(fn: () => T): Promise<T> {
-        const next = this.writeChain.then(() => fn()).catch((e) => {
+        const guarded = async () => {
+            const release = await acquireStoreLock(this.lockPath);
+            try {
+                return fn();
+            } finally {
+                release();
+            }
+        };
+        const next = this.writeChain.then(guarded).catch((e) => {
             log(`[storage] write error: ${e instanceof Error ? e.message : e}`);
             throw e;
         });
-        this.writeChain = next.then(() => {}, () => {});
+        this.writeChain = next.then(
+            () => {},
+            () => {},
+        );
         return next;
     }
 
@@ -37,7 +124,9 @@ export class Storage {
             }
             return parsed;
         } catch (err) {
-            log(`[storage] load failed: ${err instanceof Error ? err.message : err}`);
+            log(
+                `[storage] load failed: ${err instanceof Error ? err.message : err}`,
+            );
             return { ...EMPTY, accounts: {} };
         }
     }
@@ -49,7 +138,9 @@ export class Storage {
             writeFileSync(tmp, JSON.stringify(store, null, 2), { mode: 0o600 });
             renameSync(tmp, this.path);
         } catch (err) {
-            log(`[storage] save failed: ${err instanceof Error ? err.message : err}`);
+            log(
+                `[storage] save failed: ${err instanceof Error ? err.message : err}`,
+            );
             throw err;
         }
     }
@@ -100,7 +191,13 @@ export class Storage {
 
     async addUsage(
         accountName: string,
-        usage: { input: number; output: number; cacheRead: number; cacheWrite: number; model?: string },
+        usage: {
+            input: number;
+            output: number;
+            cacheRead: number;
+            cacheWrite: number;
+            model?: string;
+        },
     ): Promise<void> {
         return this.enqueueWrite(() => {
             const store = this.load();
@@ -108,9 +205,18 @@ export class Storage {
             if (!account) return;
 
             const today = new Date().toISOString().slice(0, 10);
-            const pricing = getModelPricing(usage.model);
-            const costUsd = computeUsageCost(usage, pricing);
+            const resolved = resolveModelPricing(usage.model);
+            const costUsd = computeUsageCost(usage, resolved.pricing);
             const modelKey = normalizeModelKey(usage.model);
+
+            // An unpriced model contributes $0, which reads as "free" in the
+            // totals. Say it once per model so the gap is visible.
+            if (!resolved.known && !unknownPricingReported.has(modelKey)) {
+                unknownPricingReported.add(modelKey);
+                log(
+                    `[storage] no pricing rule for "${modelKey}" — its cost is reported as $0`,
+                );
+            }
 
             if (!account.dailyUsage || account.dailyUsage.date !== today) {
                 account.dailyUsage = {
@@ -144,12 +250,16 @@ export class Storage {
             account.totalUsage.cacheReadTokens += usage.cacheRead;
             account.totalUsage.cacheWriteTokens += usage.cacheWrite;
             account.totalUsage.requestCount += 1;
-            account.totalUsage.costUsd = roundCost(account.totalUsage.costUsd + costUsd);
+            account.totalUsage.costUsd = roundCost(
+                account.totalUsage.costUsd + costUsd,
+            );
 
             if (!account.totalUsage.byModel) {
                 account.totalUsage.byModel = {};
             }
-            const perModel: PerModelUsage = account.totalUsage.byModel[modelKey] ?? {
+            const perModel: PerModelUsage = account.totalUsage.byModel[
+                modelKey
+            ] ?? {
                 inputTokens: 0,
                 outputTokens: 0,
                 cacheReadTokens: 0,
@@ -216,8 +326,10 @@ export function getCombinedTotalUsage(accounts: OpenWebUIAccount[]): {
                     existing.cacheWriteTokens += pm.cacheWriteTokens;
                     existing.requestCount += pm.requestCount;
                     existing.costUsd = roundCost(existing.costUsd + pm.costUsd);
-                    if (pm.firstSeen < existing.firstSeen) existing.firstSeen = pm.firstSeen;
-                    if (pm.lastSeen > existing.lastSeen) existing.lastSeen = pm.lastSeen;
+                    if (pm.firstSeen < existing.firstSeen)
+                        existing.firstSeen = pm.firstSeen;
+                    if (pm.lastSeen > existing.lastSeen)
+                        existing.lastSeen = pm.lastSeen;
                 } else {
                     combined.byModel[key] = { ...pm };
                 }

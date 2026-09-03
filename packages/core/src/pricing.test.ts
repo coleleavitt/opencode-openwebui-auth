@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { computeUsageCost, getModelPricing, normalizeModelKey } from "./pricing";
+import {
+    computeUsageCost,
+    getModelPricing,
+    normalizeModelKey,
+    resolveModelPricing,
+} from "./pricing";
 
 describe("getModelPricing", () => {
     test("returns zero pricing for undefined model", () => {
@@ -35,7 +40,7 @@ describe("getModelPricing", () => {
     test("matches GPT-OSS-120B", () => {
         const p = getModelPricing("openai.gpt-oss-120b-1:0");
         expect(p.inputPerMTok).toBe(0.15);
-        expect(p.outputPerMTok).toBe(0.60);
+        expect(p.outputPerMTok).toBe(0.6);
     });
 
     test("matches Bedrock Claude Opus 4", () => {
@@ -99,7 +104,9 @@ describe("normalizeModelKey", () => {
     });
 
     test("strips date suffix", () => {
-        expect(normalizeModelKey("bedrock-claude-sonnet-4-20250514")).toBe("bedrock-claude-sonnet-4");
+        expect(normalizeModelKey("bedrock-claude-sonnet-4-20250514")).toBe(
+            "bedrock-claude-sonnet-4",
+        );
     });
 
     test("returns 'unknown' for undefined", () => {
@@ -107,6 +114,76 @@ describe("normalizeModelKey", () => {
     });
 
     test("preserves vendor prefixes", () => {
-        expect(normalizeModelKey("bedrock-claude-4-6-opus")).toBe("bedrock-claude-4-6-opus");
+        expect(normalizeModelKey("bedrock-claude-4-6-opus")).toBe(
+            "bedrock-claude-4-6-opus",
+        );
+    });
+});
+
+describe("resolveModelPricing — models this deployment actually serves", () => {
+    // Claude 5 previously matched no rule and was billed at $0, which hid every
+    // Opus 5 and Sonnet 5 request from the totals.
+    test.each([
+        ["bedrock-claude-5-opus", "bedrock-opus", 15, 75],
+        ["bedrock-claude-5-sonnet", "bedrock-sonnet", 3, 15],
+        ["bedrock-claude-4-6-opus", "bedrock-opus", 15, 75],
+        ["bedrock-claude-4-6-sonnet", "bedrock-sonnet", 3, 15],
+        ["bedrock-claude-4-5-haiku", "bedrock-haiku", 1, 5],
+        ["bedrock-nova-pro-v1", "nova-pro", 0.8, 3.2],
+        [
+            "meta.llama4-maverick-17b-instruct-v1:0",
+            "llama4-maverick",
+            0.24,
+            0.97,
+        ],
+        ["openai.gpt-oss-120b-1:0", "gpt-oss", 0.15, 0.6],
+        ["openai.gpt-5.6-sol", "gpt-5", 2.5, 10],
+        ["openai.gpt-5.6-luna", "gpt-5", 2.5, 10],
+        ["openai.gpt-5.6-terra", "gpt-5", 2.5, 10],
+    ])("%s is priced by rule %s", (id, label, input, output) => {
+        const resolved = resolveModelPricing(id);
+        expect(resolved.known).toBe(true);
+        expect(resolved.label).toBe(label);
+        expect(resolved.pricing.inputPerMTok).toBe(input);
+        expect(resolved.pricing.outputPerMTok).toBe(output);
+    });
+
+    test("Claude 5 Opus bills a megatoken at the Opus rate, not zero", () => {
+        const resolved = resolveModelPricing("bedrock-claude-5-opus");
+        const cost = computeUsageCost(
+            { input: 1_000_000, output: 0, cacheRead: 0, cacheWrite: 0 },
+            resolved.pricing,
+        );
+        expect(cost).toBe(15);
+    });
+
+    test("matches a Claude family in either id order", () => {
+        expect(resolveModelPricing("claude-opus-4-6").label).toBe(
+            "bedrock-opus",
+        );
+        expect(resolveModelPricing("bedrock-claude-5-opus").label).toBe(
+            "bedrock-opus",
+        );
+    });
+
+    test("an unmatched model is reported as unknown, not as free", () => {
+        const resolved = resolveModelPricing("google.gemma-4-31b");
+        expect(resolved.known).toBe(false);
+        expect(resolved.label).toBe("unknown");
+        expect(resolved.pricing.inputPerMTok).toBe(0);
+    });
+
+    test("undefined and unrelated ids stay unknown", () => {
+        expect(resolveModelPricing(undefined).known).toBe(false);
+        expect(resolveModelPricing("llama-3.1-70b").known).toBe(false);
+    });
+
+    test("getModelPricing still returns the bare pricing for existing callers", () => {
+        expect(getModelPricing("bedrock-claude-5-opus")).toEqual(
+            resolveModelPricing("bedrock-claude-5-opus").pricing,
+        );
+        expect(normalizeModelKey("Bedrock-Claude-5-Opus")).toBe(
+            "bedrock-claude-5-opus",
+        );
     });
 });
