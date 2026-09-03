@@ -3,8 +3,8 @@ import {
     fetchInstanceConfig,
     listModels,
     normalizeBaseUrl,
-    oidcLogin,
     type OpenWebUIAccount,
+    oidcLogin,
     parseJwtClaims,
     Storage,
     verifyToken,
@@ -33,19 +33,25 @@ Env:
 }
 
 async function cmdLogin(args: string[]): Promise<void> {
-    const baseUrl = normalizeBaseUrl(args[0] ?? process.env.OWUI_BASE_URL ?? "https://chat.ai2s.org");
+    const baseUrl = normalizeBaseUrl(
+        args[0] ?? process.env.OWUI_BASE_URL ?? "https://chat.ai2s.org",
+    );
     const username = process.env.OWUI_USERNAME;
     const password = process.env.OWUI_PASSWORD;
     const duoPasscode = process.env.OWUI_DUO_PASSCODE;
 
     if (!username || !password) {
-        throw new Error("Set OWUI_USERNAME and OWUI_PASSWORD environment variables");
+        throw new Error(
+            "Set OWUI_USERNAME and OWUI_PASSWORD environment variables",
+        );
     }
 
     console.log(`logging in to ${baseUrl} as ${username}...`);
     const method = duoPasscode ? "passcode" : "push";
     if (method === "push") {
-        console.log("no OWUI_DUO_PASSCODE set — will send Duo Push (approve on your phone)");
+        console.log(
+            "no OWUI_DUO_PASSCODE set — will send Duo Push (approve on your phone)",
+        );
     }
 
     const result = await oidcLogin({
@@ -67,10 +73,8 @@ async function cmdLogin(args: string[]): Promise<void> {
         createdAt: Date.now(),
         updatedAt: Date.now(),
     };
-    new Storage().upsert(account);
-    console.log(
-        `\nlogged in as ${user.name} <${user.email}> (${user.role})`,
-    );
+    await new Storage().upsert(account);
+    console.log(`\nlogged in as ${user.name} <${user.email}> (${user.role})`);
     console.log(`instance: ${cfg?.name ?? "unknown"} v${cfg?.version ?? "?"}`);
     console.log(`token expires: ${new Date(result.expiresAt).toISOString()}`);
 }
@@ -93,9 +97,9 @@ async function cmdAdd(args: string[]): Promise<void> {
         createdAt: Date.now(),
         updatedAt: Date.now(),
     };
-    new Storage().upsert(account);
+    await new Storage().upsert(account);
     console.log(
-        `added ${name}  (instance=${cfg?.name ?? "unknown"} v${cfg?.version ?? "?"}, expires=${new Date(account.expiresAt!).toISOString()})`,
+        `added ${name}  (instance=${cfg?.name ?? "unknown"} v${cfg?.version ?? "?"}, expires=${new Date(claims.exp * 1000).toISOString()})`,
     );
 }
 
@@ -109,21 +113,27 @@ function cmdList(): void {
     for (const a of accounts) {
         const star = a.name === current ? "*" : " ";
         const exp = a.expiresAt ? new Date(a.expiresAt).toISOString() : "?";
-        console.log(`${star} ${a.name.padEnd(48)}  ${a.baseUrl}  expires=${exp}`);
+        console.log(
+            `${star} ${a.name.padEnd(48)}  ${a.baseUrl}  expires=${exp}`,
+        );
     }
 }
 
-function cmdUse(args: string[]): void {
+async function cmdUse(args: string[]): Promise<void> {
     const name = args[0];
     if (!name) usage();
-    if (!new Storage().setCurrent(name)) throw new Error(`No account named ${name}`);
+    // setCurrent resolves to false for an unknown name; without the await the
+    // process could also exit before the store write lands.
+    if (!(await new Storage().setCurrent(name))) {
+        throw new Error(`No account named ${name}`);
+    }
     console.log(`current -> ${name}`);
 }
 
-function cmdRemove(args: string[]): void {
+async function cmdRemove(args: string[]): Promise<void> {
     const name = args[0];
     if (!name) usage();
-    new Storage().remove(name);
+    await new Storage().remove(name);
     console.log(`removed ${name}`);
 }
 
@@ -144,7 +154,9 @@ async function cmdModels(args: string[]): Promise<void> {
         return;
     }
 
-    const capFlags = (caps: Record<string, boolean | undefined> | undefined): string => {
+    const capFlags = (
+        caps: Record<string, boolean | undefined> | undefined,
+    ): string => {
         if (!caps) return "";
         const flag = (k: string, c: string) => (caps[k] ? c : "·");
         return [
@@ -159,18 +171,26 @@ async function cmdModels(args: string[]): Promise<void> {
     };
 
     if (flags.has("--verbose") || flags.has("-v")) {
-        console.log("LEGEND: V=vision F=file W=web-search C=code-interp T=tools Q=citations U=usage  (· = off)");
+        console.log(
+            "LEGEND: V=vision F=file W=web-search C=code-interp T=tools Q=citations U=usage  (· = off)",
+        );
         console.log();
-        console.log(`${"ID".padEnd(46)}  ${"OWNER".padEnd(10)}  ${"CONN".padEnd(8)}  CAPS     NAME`);
+        console.log(
+            `${"ID".padEnd(46)}  ${"OWNER".padEnd(10)}  ${"CONN".padEnd(8)}  CAPS     NAME`,
+        );
         console.log("─".repeat(120));
         for (const m of models.data) {
             const caps = capFlags(m.info?.meta?.capabilities);
             const owner = (m.owned_by ?? "?").padEnd(10).slice(0, 10);
             const conn = (m.connection_type ?? "?").padEnd(8).slice(0, 8);
-            console.log(`${m.id.padEnd(46)}  ${owner}  ${conn}  ${caps}  ${m.name ?? ""}`);
+            console.log(
+                `${m.id.padEnd(46)}  ${owner}  ${conn}  ${caps}  ${m.name ?? ""}`,
+            );
         }
         console.log();
-        console.log(`${models.data.length} model(s) accessible to ${account.name}`);
+        console.log(
+            `${models.data.length} model(s) accessible to ${account.name}`,
+        );
     } else {
         for (const m of models.data) {
             console.log(`${m.id.padEnd(48)}  ${m.name ?? ""}`);
@@ -180,8 +200,13 @@ async function cmdModels(args: string[]): Promise<void> {
 
 async function cmdConfig(args: string[]): Promise<void> {
     const storage = new Storage();
-    const account = args[0] ? storage.list().find((a) => a.name === args[0]) : storage.getCurrent();
-    const baseUrl = account?.baseUrl ?? process.env.OWUI_BASE_URL ?? "https://chat.ai2s.org";
+    const account = args[0]
+        ? storage.list().find((a) => a.name === args[0])
+        : storage.getCurrent();
+    const baseUrl =
+        account?.baseUrl ??
+        process.env.OWUI_BASE_URL ??
+        "https://chat.ai2s.org";
     const cfg = await fetchInstanceConfig(baseUrl);
     const enabledFeatures = Object.entries(cfg.features ?? {})
         .filter(([, v]) => v)
@@ -215,10 +240,10 @@ try {
             cmdList();
             break;
         case "use":
-            cmdUse(rest);
+            await cmdUse(rest);
             break;
         case "remove":
-            cmdRemove(rest);
+            await cmdRemove(rest);
             break;
         case "models":
             await cmdModels(rest);
