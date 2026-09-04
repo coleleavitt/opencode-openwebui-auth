@@ -20,10 +20,11 @@ import {
     formatStreamDiagnostics,
     isRetryableErrorBody,
     isRetryableStreamError,
+    isTransientNetworkError,
     log,
     logDebugArtifact,
     logStream,
-    MAX_RETRIES,
+    maxRetries,
     newStreamDiagnostics,
     nextRetryDelayMs,
     normalizeStreamError,
@@ -164,15 +165,26 @@ export function streamOpenWebUI(
         );
         const url = `${baseUrl}/api/chat/completions`;
 
-        const body = buildOpenAIRequest(model.id, context, {
-            maxTokens: options?.maxTokens ?? Math.floor(model.maxTokens / 3),
-            temperature: options?.temperature,
-            reasoning: options?.reasoning,
-            supportsReasoning: model.reasoning,
-        });
-        const payload = JSON.stringify(body);
+        // Hidden reasoning counts against max_tokens on Bedrock gpt-5.x: a
+        // budget the model spends entirely on reasoning ends with
+        // finish_reason=length and no text. Start from the caller's budget and
+        // grow it once, up to the model cap, when that happens.
+        let maxTokens = Math.min(
+            options?.maxTokens ?? Math.floor(model.maxTokens / 3),
+            model.maxTokens,
+        );
+        const buildPayload = () =>
+            buildOpenAIRequest(model.id, context, {
+                maxTokens,
+                temperature: options?.temperature,
+                reasoning: options?.reasoning,
+                supportsReasoning: model.reasoning,
+            });
+        let body = buildPayload();
+        let payload = JSON.stringify(body);
         const requestId = Math.random().toString(36).slice(2, 10);
         const tag = `req=${requestId} model=${model.id} msgs=${body.messages.length} tools=${body.tools?.length ?? 0}`;
+        const retryBudget = maxRetries();
 
         const safetySignal = AbortSignal.timeout(SAFETY_TIMEOUT_MS);
         const signals: AbortSignal[] = [safetySignal];
@@ -200,7 +212,8 @@ export function streamOpenWebUI(
         /** Run the HTTP-level retry loop; resolves with an OK response or throws. */
         const fetchOk = async (): Promise<Response> => {
             let res: Response | undefined;
-            for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+            let networkFailures = 0;
+            for (let attempt = 0; attempt <= retryBudget; attempt++) {
                 if (attempt > 0 && res) {
                     const delay = nextRetryDelayMs(
                         res,
@@ -216,16 +229,35 @@ export function streamOpenWebUI(
                 }
 
                 const started = Date.now();
-                res = await fetch(url, {
-                    method: "POST",
-                    headers: {
-                        "Content-Type": "application/json",
-                        Accept: "text/event-stream",
-                        Authorization: `Bearer ${token}`,
-                    },
-                    body: payload,
-                    signal,
-                });
+                try {
+                    res = await fetch(url, {
+                        method: "POST",
+                        headers: {
+                            "Content-Type": "application/json",
+                            Accept: "text/event-stream",
+                            Authorization: `Bearer ${token}`,
+                        },
+                        body: payload,
+                        signal,
+                    });
+                } catch (err) {
+                    if (
+                        !isTransientNetworkError(err) ||
+                        networkFailures >= retryBudget ||
+                        signal.aborted
+                    ) {
+                        throw err;
+                    }
+                    networkFailures++;
+                    const delay = backoffDelayMs(networkFailures);
+                    logStream(
+                        "pi",
+                        `${tag} attempt=${attempt} outcome=network-error retry_in_ms=${Math.round(delay)} err="${truncateForLog(err instanceof Error ? err.message : String(err))}"`,
+                    );
+                    await new Promise((r) => setTimeout(r, delay));
+                    attempt--; // transport failures have their own budget
+                    continue;
+                }
                 await options?.onResponse?.(res as never, model);
                 logStream(
                     "pi",
@@ -244,7 +276,7 @@ export function streamOpenWebUI(
                 }
 
                 // LiteLLM sometimes mislabels a transient Bedrock 503 as 400.
-                if (res.status === 400 && attempt < MAX_RETRIES) {
+                if (res.status === 400 && attempt < retryBudget) {
                     const peek = await peekBody(res);
                     if (isRetryableErrorBody(peek)) {
                         log(
@@ -257,7 +289,7 @@ export function streamOpenWebUI(
                 const retryable =
                     res.status === RATE_LIMIT_STATUS ||
                     RETRY_STATUSES.has(res.status);
-                if (!retryable || attempt >= MAX_RETRIES) break;
+                if (!retryable || attempt >= retryBudget) break;
             }
             const detail = res
                 ? `${res.status} ${truncateForLog(await peekBody(res), 500)}`
@@ -301,7 +333,21 @@ export function streamOpenWebUI(
                         res = await fetchOk();
                         continue;
                     }
-                    if (err.retryable && streamAttempt < MAX_RETRIES) {
+                    if (
+                        err.kind === "empty" &&
+                        diag.finishReason === "length" &&
+                        maxTokens < model.maxTokens
+                    ) {
+                        maxTokens = Math.min(maxTokens * 4, model.maxTokens);
+                        body = buildPayload();
+                        payload = JSON.stringify(body);
+                        log(
+                            `[pi-stream] ${tag} reasoning consumed the whole output budget; retrying with max_tokens=${maxTokens}`,
+                        );
+                        res = await fetchOk();
+                        continue;
+                    }
+                    if (err.retryable && streamAttempt < retryBudget) {
                         const delay = backoffDelayMs(streamAttempt + 1);
                         log(
                             `[pi-stream] ${tag} stream retry #${streamAttempt + 1} in ${Math.round(delay)}ms after ${err.kind}`,

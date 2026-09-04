@@ -347,6 +347,39 @@ describe("owuiFetch chat/completions admission", () => {
         });
     });
 
+    it("regression: a thrown 'fetch failed' is retried once the socket comes back", async () => {
+        process.env.OWUI_RETRY_BASE_MS = "1";
+        await withStore(async (storage) => {
+            let calls = 0;
+            globalThis.fetch = (async () => {
+                calls++;
+                if (calls === 1) {
+                    throw new TypeError("fetch failed", {
+                        cause: Object.assign(new Error("read ECONNRESET"), {
+                            code: "ECONNRESET",
+                        }),
+                    });
+                }
+                return new Response(JSON.stringify({ choices: [] }), {
+                    status: 200,
+                    headers: { "content-type": "application/json" },
+                });
+            }) as unknown as typeof fetch;
+            const res = await makeOwuiFetch(storage)(
+                "https://placeholder/v1/chat/completions",
+                {
+                    method: "POST",
+                    body: JSON.stringify({
+                        model: "m",
+                        messages: [{ role: "user", content: "hi" }],
+                    }),
+                },
+            );
+            expect(calls).toBe(2);
+            expect(res.status).toBe(200);
+        });
+    });
+
     it("passes an event stream through unchanged while recording diagnostics", async () => {
         await withStore(async (storage) => {
             const sse =

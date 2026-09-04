@@ -414,3 +414,106 @@ test("tool-call-only streams settle as toolUse, not empty", async () => {
     expect(call.name).toBe("read");
     expect(call.arguments).toEqual({ path: "a" });
 });
+
+test("regression: hidden reasoning that eats max_tokens is retried once with a larger budget", async () => {
+    // Live shape from a 24-way fan-out on 2026-09-04: one redacted reasoning
+    // chunk, finish_reason=length, usage 400/400, no text.
+    const exhausted = [
+        JSON.stringify({
+            choices: [
+                {
+                    delta: {
+                        reasoning_content: "",
+                        thinking_blocks: [
+                            { type: "redacted_thinking", data: "AAAA" },
+                        ],
+                    },
+                },
+            ],
+        }),
+        JSON.stringify({ choices: [{ delta: {}, finish_reason: "length" }] }),
+        JSON.stringify({
+            choices: [{ delta: {} }],
+            usage: {
+                prompt_tokens: 24,
+                completion_tokens: 400,
+                total_tokens: 424,
+            },
+        }),
+    ];
+    const bodies: number[] = [];
+    let calls = 0;
+    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+        bodies.push(
+            (JSON.parse(String(init?.body)) as { max_tokens: number })
+                .max_tokens,
+        );
+        calls++;
+        return calls === 1 ? sseResponse(exhausted) : sseResponse(OK_STREAM);
+    }) as unknown as typeof fetch;
+    const events: Captured[] = [];
+    for await (const event of streamOpenWebUI(MODEL, CONTEXT, {
+        apiKey: "test-token",
+        maxTokens: 400,
+    })) {
+        events.push(event as unknown as Captured);
+    }
+    expect(bodies).toEqual([400, 1600]);
+    expect(events.filter((event) => event.type === "start")).toHaveLength(1);
+    expect(last(events).type).toBe("done");
+    expect(events.find((event) => event.type === "text_end")?.content).toBe(
+        "OK",
+    );
+});
+
+test("regression: a thrown 'fetch failed' is retried, an abort is not", async () => {
+    let calls = 0;
+    globalThis.fetch = (async () => {
+        calls++;
+        if (calls === 1) {
+            throw new TypeError("fetch failed", {
+                cause: Object.assign(new Error("connect ECONNREFUSED"), {
+                    code: "ECONNREFUSED",
+                }),
+            });
+        }
+        return sseResponse(OK_STREAM);
+    }) as unknown as typeof fetch;
+    const events: Captured[] = [];
+    for await (const event of streamOpenWebUI(MODEL, CONTEXT, {
+        apiKey: "t",
+    })) {
+        events.push(event as unknown as Captured);
+    }
+    expect(calls).toBe(2);
+    expect(last(events).type).toBe("done");
+
+    let abortCalls = 0;
+    globalThis.fetch = (async () => {
+        abortCalls++;
+        const error = new Error("This operation was aborted");
+        error.name = "AbortError";
+        throw error;
+    }) as unknown as typeof fetch;
+    const aborted: Captured[] = [];
+    for await (const event of streamOpenWebUI(MODEL, CONTEXT, {
+        apiKey: "t",
+    })) {
+        aborted.push(event as unknown as Captured);
+    }
+    expect(abortCalls).toBe(1);
+    expect(last(aborted).type).toBe("error");
+    expect(last(aborted).error?.stopReason).toBe("aborted");
+});
+
+test("OWUI_MAX_RETRIES=0 disables every retry", async () => {
+    process.env.OWUI_MAX_RETRIES = "0";
+    try {
+        const { events, calls } = await collectFrom([() => sseResponse([])]);
+        expect(calls).toBe(1);
+        expect(last(events).type).toBe("error");
+    } finally {
+        process.env.OWUI_MAX_RETRIES = undefined;
+        delete process.env.OWUI_MAX_RETRIES;
+    }
+});

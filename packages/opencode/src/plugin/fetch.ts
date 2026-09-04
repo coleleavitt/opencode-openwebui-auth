@@ -3,16 +3,18 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import {
     AUTH_RETRY_STATUSES,
+    backoffDelayMs,
     carriedNoContent,
     formatStreamDiagnostics,
     isTokenExpired,
+    isTransientNetworkError,
     log,
     logDebugArtifact,
     logRequest,
     logResponse,
     logStream,
-    MAX_RETRIES,
     MAX_RETRY_AFTER_MS,
+    maxRetries,
     newStreamDiagnostics,
     type OpenWebUIAccount,
     oidcLogin,
@@ -403,7 +405,9 @@ export function makeOwuiFetch(storage: Storage) {
         // When a 429 carries a Retry-After, the next iteration waits exactly that
         // long instead of the generic exponential backoff.
         let pendingDelayMs: number | undefined;
-        for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+        const retryBudget = maxRetries();
+        let networkFailures = 0;
+        for (let attempt = 0; attempt <= retryBudget; attempt++) {
             if (attempt > 0) {
                 const delay =
                     pendingDelayMs ??
@@ -418,7 +422,27 @@ export function makeOwuiFetch(storage: Storage) {
             }
 
             logRequest(url.toString(), init?.method ?? "GET");
-            const res = await fetch(url, fetchOpts);
+            let res: Response;
+            try {
+                res = await fetch(url, fetchOpts);
+            } catch (err) {
+                if (
+                    !isTransientNetworkError(err) ||
+                    networkFailures >= retryBudget ||
+                    combinedSignal.aborted
+                ) {
+                    throw err;
+                }
+                networkFailures++;
+                const delay = backoffDelayMs(networkFailures);
+                logStream(
+                    "opencode",
+                    `model=${requestModelId ?? "unknown"} outcome=network-error retry_in_ms=${Math.round(delay)} err="${truncateForLog(err instanceof Error ? err.message : String(err))}"`,
+                );
+                await new Promise((r) => setTimeout(r, delay));
+                attempt--; // transport failures have their own budget
+                continue;
+            }
             logResponse(url.toString(), res.status);
             lastRes = res;
 
@@ -506,7 +530,7 @@ export function makeOwuiFetch(storage: Storage) {
             // Rate limited (429). The instance's rate_limit_inlet_filter and the
             // upstream provider both emit this; honor Retry-After when present,
             // clamped to MAX_RETRY_AFTER_MS, otherwise fall through to backoff.
-            if (res.status === RATE_LIMIT_STATUS && attempt < MAX_RETRIES) {
+            if (res.status === RATE_LIMIT_STATUS && attempt < retryBudget) {
                 const retryAfter = parseRetryAfterMs(res);
                 pendingDelayMs =
                     retryAfter !== undefined
@@ -537,7 +561,7 @@ export function makeOwuiFetch(storage: Storage) {
                 xShouldRetry === "true" ||
                 (xShouldRetry !== "false" && RETRY_STATUSES.has(res.status));
 
-            if (shouldRetry && attempt < MAX_RETRIES) {
+            if (shouldRetry && attempt < retryBudget) {
                 try {
                     const text = await res.text();
                     bodyLog(RES_LOG, {
@@ -554,7 +578,7 @@ export function makeOwuiFetch(storage: Storage) {
             // See RETRYABLE_BODY_PATTERNS for details on the upstream bug.
             if (
                 res.status === 400 &&
-                attempt < MAX_RETRIES &&
+                attempt < retryBudget &&
                 isChatCompletions
             ) {
                 try {

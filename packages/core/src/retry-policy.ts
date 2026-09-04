@@ -18,6 +18,49 @@ export const AUTH_RETRY_STATUSES = new Set([401, 403]);
 export const MAX_RETRIES = 2;
 export const RETRY_BASE_MS = 1500;
 
+/** Retry budget; OWUI_MAX_RETRIES overrides it (0 disables retries). */
+export function maxRetries(): number {
+    const raw = Number(process.env.OWUI_MAX_RETRIES);
+    return Number.isInteger(raw) && raw >= 0 && raw <= 10 ? raw : MAX_RETRIES;
+}
+
+// Errors thrown by fetch itself (no Response) when the socket dies: undici's
+// "fetch failed" wraps the cause. A short OWUI restart shows up as a burst of
+// these; the 2026-09-02 21:10-21:15 window produced 12 in one session.
+const TRANSIENT_NETWORK_SIGNATURES = [
+    "fetch failed",
+    "ECONNRESET",
+    "ECONNREFUSED",
+    "ETIMEDOUT",
+    "EAI_AGAIN",
+    "EPIPE",
+    "UND_ERR_SOCKET",
+    "UND_ERR_CONNECT_TIMEOUT",
+    "UND_ERR_HEADERS_TIMEOUT",
+    "UND_ERR_BODY_TIMEOUT",
+    "socket hang up",
+    "other side closed",
+    "terminated",
+];
+
+/** True for a thrown transport error worth one bounded retry; never for aborts. */
+export function isTransientNetworkError(error: unknown): boolean {
+    if (!(error instanceof Error)) return false;
+    if (error.name === "AbortError" || error.name === "TimeoutError")
+        return false;
+    const seen = new Set<unknown>();
+    let current: unknown = error;
+    while (current instanceof Error && !seen.has(current)) {
+        seen.add(current);
+        const code = (current as { code?: unknown }).code;
+        const text = `${current.name} ${current.message} ${typeof code === "string" ? code : ""}`;
+        if (TRANSIENT_NETWORK_SIGNATURES.some((sig) => text.includes(sig)))
+            return true;
+        current = (current as { cause?: unknown }).cause;
+    }
+    return false;
+}
+
 /** Cap the honored Retry-After so a hostile/buggy header can't stall a request. */
 export const MAX_RETRY_AFTER_MS = 30_000;
 

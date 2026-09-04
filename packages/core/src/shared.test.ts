@@ -313,6 +313,32 @@ describe("parseUsageFromBuffer", () => {
     it("returns undefined without a usage block", () => {
         expect(parseUsageFromBuffer("data: {}")).toBeUndefined();
     });
+    it("reads cached_tokens out of the nested prompt_tokens_details (live LiteLLM shape)", () => {
+        // Verbatim shape from genai.arizona.edu on 2026-09-04: the details
+        // objects nest, so a `[^}]*` regex stopped at completion_tokens_details
+        // and reported cacheRead=0 for every cached request.
+        const buf = [
+            'data: {"choices":[{"delta":{"content":"OK"}}]}',
+            'data: {"choices":[{"index":0,"delta":{}}],"usage":{"completion_tokens":5,"prompt_tokens":11,"total_tokens":16,"completion_tokens_details":{"reasoning_tokens":0,"text_tokens":5},"prompt_tokens_details":{"cached_tokens":7,"text_tokens":4,"cache_write_tokens":3,"cache_creation_tokens":3},"cache_creation_input_tokens":3,"cache_read_input_tokens":7}}',
+            "data: [DONE]",
+        ].join("\n");
+        expect(parseUsageFromBuffer(buf)).toEqual({
+            input: 11,
+            output: 5,
+            cacheRead: 7,
+            cacheWrite: 3,
+        });
+    });
+    it("recovers a usage object from a buffer whose head was cut mid-frame", () => {
+        const buf =
+            'ent":"x"}}]}\ndata: {"choices":[],"usage":{"completion_tokens":2,"prompt_tokens":3,"prompt_tokens_details":{"cached_tokens":1}}}';
+        expect(parseUsageFromBuffer(buf.slice(20))).toEqual({
+            input: 3,
+            output: 2,
+            cacheRead: 1,
+            cacheWrite: 0,
+        });
+    });
 });
 
 describe("inferModelLimits (OWUI/LiteLLM+Bedrock, verified live + catalog)", () => {
