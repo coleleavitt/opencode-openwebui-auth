@@ -1,8 +1,11 @@
 // Shared retry policy for OWUI/LiteLLM+Bedrock traffic. Used by every adapter so
 // the opencode fetch shim and the pi streamSimple retry identically.
 
-/** 5xx and Anthropic "overloaded" (529) are transient — retry with backoff. */
-export const RETRY_STATUSES = new Set([502, 503, 504, 529]);
+/** 5xx and Anthropic "overloaded" (529) are transient — retry with backoff.
+ *  424 is Bedrock's modelStreamErrorException ("An error occurred while
+ *  streaming the response. Retry your request.") as modeled in botocore's
+ *  bedrock-runtime ConverseStreamOutput; LiteLLM >= 1.9x surfaces it. */
+export const RETRY_STATUSES = new Set([424, 502, 503, 504, 529]);
 
 /** 429 = rate limited. The instance runs an active rate_limit_inlet_filter, and
  *  upstream (Anthropic/Bedrock) also emit 429 with a Retry-After hint. Handled
@@ -24,8 +27,15 @@ export const MAX_RETRY_AFTER_MS = 30_000;
 // errors) rather than mapping :exception-type to the correct semantic code.
 // Detect these by inspecting the response body for known transient signatures
 // and retry them as if they were 503s.
+// The mid-stream exception members of bedrock-runtime's ConverseStreamOutput
+// (botocore service-2.json): internalServerException 500,
+// modelStreamErrorException 424, throttlingException 429,
+// serviceUnavailableException 503 are transient; validationException 400 is
+// not and is deliberately absent.
 export const RETRYABLE_BODY_PATTERNS = [
     "serviceUnavailableException",
+    "throttlingException",
+    "internalServerException",
     "Bedrock is unable to process your request",
     "MidStreamFallbackError",
     "modelTimeoutException",

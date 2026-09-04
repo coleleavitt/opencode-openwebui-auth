@@ -67,6 +67,23 @@ test("normalizes the error shapes each layer emits", () => {
         }),
     ).toBe(true);
     expect(isRetryableStreamError({ message: "rate", code: 429 })).toBe(true);
+    // Older LiteLLM labels every mid-stream Bedrock event 400; the modeled
+    // exception name in the message is then the only retry signal.
+    expect(
+        isRetryableStreamError({
+            message: 'throttlingException {"message":"Too many requests"}',
+            code: 400,
+        }),
+    ).toBe(true);
+    expect(
+        isRetryableStreamError({
+            message: 'validationException {"message":"bad input"}',
+            code: 400,
+        }),
+    ).toBe(false);
+    expect(isRetryableStreamError({ message: "stream broke", code: 424 })).toBe(
+        true,
+    );
 });
 
 test("diagnostics distinguish an error-only stream from a real completion", () => {
