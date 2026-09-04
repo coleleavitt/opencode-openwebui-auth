@@ -56,9 +56,15 @@ export function parseRetryAfterMs(res: {
     return undefined;
 }
 
+/** Base backoff; OWUI_RETRY_BASE_MS overrides it (tests, impatient operators). */
+export function retryBaseMs(): number {
+    const raw = Number(process.env.OWUI_RETRY_BASE_MS);
+    return Number.isFinite(raw) && raw >= 0 ? raw : RETRY_BASE_MS;
+}
+
 /** Jittered exponential backoff for retry attempt N (1-based). */
 export function backoffDelayMs(attempt: number): number {
-    return RETRY_BASE_MS * 2 ** (attempt - 1) * (0.5 + Math.random() * 0.5);
+    return retryBaseMs() * 2 ** (attempt - 1) * (0.5 + Math.random() * 0.5);
 }
 
 /**

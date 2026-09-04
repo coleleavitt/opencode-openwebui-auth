@@ -9,6 +9,7 @@ export * from "./oauth/oidc-login";
 export * from "./pricing";
 export * from "./request-shaping";
 export * from "./retry-policy";
+export * from "./sse-frames";
 export * from "./storage";
 export * from "./types";
 export * from "./usage-parse";

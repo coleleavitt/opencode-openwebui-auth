@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 import {
     parseRetryAfterMs,
     sanitizeBedrockContent,
@@ -284,5 +284,91 @@ describe("parseRetryAfterMs", () => {
 
     it("returns undefined for an unparseable value", () => {
         expect(parseRetryAfterMs(withHeader("soon"))).toBeUndefined();
+    });
+});
+
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Storage } from "@openwebui-auth/core";
+import { makeOwuiFetch } from "./fetch";
+
+function fakeJwt(expSeconds: number): string {
+    const b64 = (value: object) =>
+        Buffer.from(JSON.stringify(value)).toString("base64url");
+    return `${b64({ alg: "HS256" })}.${b64({ id: "u1", exp: expSeconds })}.sig`;
+}
+
+async function withStore<T>(fn: (storage: Storage) => Promise<T>): Promise<T> {
+    const dir = mkdtempSync(join(tmpdir(), "owui-fetch-"));
+    const storage = new Storage(join(dir, "accounts.json"));
+    await storage.upsert({
+        name: "test",
+        baseUrl: "https://owui.invalid",
+        token: fakeJwt(Math.floor(Date.now() / 1000) + 86_400),
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+    });
+    await storage.setCurrent("test");
+    try {
+        return await fn(storage);
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+}
+
+describe("owuiFetch chat/completions admission", () => {
+    const realFetch = globalThis.fetch;
+    afterEach(() => {
+        globalThis.fetch = realFetch;
+    });
+
+    it("regression: an HTML 200 from the SPA is converted into a JSON 502, not passed through", async () => {
+        await withStore(async (storage) => {
+            globalThis.fetch = (async () =>
+                new Response("<!DOCTYPE html><html><body>login</body></html>", {
+                    status: 200,
+                    headers: { "content-type": "text/html; charset=utf-8" },
+                })) as unknown as typeof fetch;
+            const res = await makeOwuiFetch(storage)(
+                "https://placeholder/v1/chat/completions",
+                {
+                    method: "POST",
+                    body: JSON.stringify({
+                        model: "m",
+                        stream: true,
+                        messages: [{ role: "user", content: "hi" }],
+                    }),
+                },
+            );
+            expect(res.status).toBe(502);
+            const body = (await res.json()) as { error: { message: string } };
+            expect(body.error.message).toContain("HTML page");
+        });
+    });
+
+    it("passes an event stream through unchanged while recording diagnostics", async () => {
+        await withStore(async (storage) => {
+            const sse =
+                'data: {"choices":[{"delta":{"content":"OK"}}]}\n\ndata: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n';
+            globalThis.fetch = (async () =>
+                new Response(sse, {
+                    status: 200,
+                    headers: { "content-type": "text/event-stream" },
+                })) as unknown as typeof fetch;
+            const res = await makeOwuiFetch(storage)(
+                "https://placeholder/v1/chat/completions",
+                {
+                    method: "POST",
+                    body: JSON.stringify({
+                        model: "m",
+                        stream: true,
+                        messages: [{ role: "user", content: "hi" }],
+                    }),
+                },
+            );
+            expect(res.status).toBe(200);
+            expect(await res.text()).toBe(sse);
+        });
     });
 });

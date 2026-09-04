@@ -3,12 +3,17 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import {
     AUTH_RETRY_STATUSES,
+    carriedNoContent,
+    formatStreamDiagnostics,
     isTokenExpired,
     log,
+    logDebugArtifact,
     logRequest,
     logResponse,
+    logStream,
     MAX_RETRIES,
     MAX_RETRY_AFTER_MS,
+    newStreamDiagnostics,
     type OpenWebUIAccount,
     oidcLogin,
     parseRetryAfterMs,
@@ -17,9 +22,13 @@ import {
     RETRY_BASE_MS,
     RETRY_STATUSES,
     RETRYABLE_BODY_PATTERNS,
+    reachedTerminalFrame,
+    recordChunkContent,
     refreshSkewMs,
     type Storage,
+    scanSseText,
     shapeBedrockRequestBody,
+    truncateForLog,
 } from "@openwebui-auth/core";
 
 const BODY_LOG_DIR = join(
@@ -210,6 +219,10 @@ function interceptUsage(
 
     (async () => {
         const reader = usageStream.getReader();
+        const diag = newStreamDiagnostics();
+        const started = Date.now();
+        let carry = "";
+        let rawTail = "";
         try {
             const decoder = new TextDecoder();
             let buffer = "";
@@ -217,14 +230,22 @@ function interceptUsage(
                 if (abortController.signal.aborted) break;
                 const { done, value } = await reader.read();
                 if (done) break;
-                buffer += decoder.decode(value as Uint8Array | undefined, {
+                const text = decoder.decode(value as Uint8Array | undefined, {
                     stream: true,
                 });
+                diag.bytes += value?.byteLength ?? 0;
+                carry = scanSseText(diag, text, carry, (chunk) =>
+                    recordChunkContent(diag, chunk),
+                );
+                buffer += text;
                 if (buffer.length > 4096) {
                     buffer = buffer.slice(-4096);
                 }
+                rawTail += text;
+                if (rawTail.length > 16384) rawTail = rawTail.slice(-16384);
             }
 
+            if (carry.trim().length > 0) scanSseText(diag, "\n", carry);
             const usage = parseUsageFromBuffer(buffer);
             if (usage) {
                 log(
@@ -234,6 +255,32 @@ function interceptUsage(
                     ...usage,
                     model: modelId,
                 });
+            }
+            // opencode parses the stream itself; this side only records what
+            // the proxy sent so an error frame, a truncated body or an empty
+            // completion is visible in the log instead of vanishing.
+            const suspicious =
+                diag.firstError !== undefined ||
+                !reachedTerminalFrame(diag) ||
+                carriedNoContent(diag);
+            logStream(
+                "opencode",
+                `model=${modelId ?? "unknown"} ms=${Date.now() - started} outcome=${
+                    diag.firstError
+                        ? "error-frame"
+                        : !reachedTerminalFrame(diag)
+                          ? "truncated"
+                          : carriedNoContent(diag)
+                            ? "empty"
+                            : "ok"
+                } ${formatStreamDiagnostics(diag)}`,
+            );
+            if (suspicious) {
+                logDebugArtifact(
+                    "opencode-stream-failures",
+                    `model=${modelId ?? "unknown"} ${formatStreamDiagnostics(diag)}`,
+                    rawTail,
+                );
             }
         } catch {
             // Usage tracking is best-effort
@@ -250,6 +297,14 @@ function interceptUsage(
         statusText: res.statusText,
         headers: res.headers,
     });
+}
+
+async function peekText(res: Response): Promise<string> {
+    try {
+        return (await res.clone().text()).slice(0, 500);
+    } catch {
+        return "";
+    }
 }
 
 export function makeOwuiFetch(storage: Storage) {
@@ -368,6 +423,37 @@ export function makeOwuiFetch(storage: Storage) {
             lastRes = res;
 
             if (res.ok) {
+                // A 200 that is not JSON/SSE is the SPA (wrong host or a
+                // session redirect). Fail closed: opencode would otherwise
+                // parse nothing and settle an empty assistant turn.
+                const contentType = (
+                    res.headers.get("content-type") ?? ""
+                ).toLowerCase();
+                if (
+                    isChatCompletions &&
+                    !contentType.includes("application/json") &&
+                    !contentType.includes("text/event-stream") &&
+                    !contentType.includes("application/x-ndjson")
+                ) {
+                    const sample = await peekText(res);
+                    logStream(
+                        "opencode",
+                        `model=${requestModelId ?? "unknown"} outcome=unexpected-content-type status=${res.status} ct=${contentType || "none"} sample="${truncateForLog(sample, 160)}"`,
+                    );
+                    return new Response(
+                        JSON.stringify({
+                            error: {
+                                message: `OpenWebUI returned ${contentType || "an unknown content type"} instead of a completion (HTML page: wrong host or expired session?)`,
+                                type: "proxy_error",
+                                code: 502,
+                            },
+                        }),
+                        {
+                            status: 502,
+                            headers: { "Content-Type": "application/json" },
+                        },
+                    );
+                }
                 if (isChatCompletions && res.body && accountForUsage) {
                     return interceptUsage(
                         res,
