@@ -119,7 +119,12 @@ const MODEL_LIMITS: [RegExp, ModelLimits][] = [
     [/llama.*3/i, { context: 131072, output: 8192 }],
     // Output was 131072 — the context limit duplicated. Impossible as an output
     // cap, and max_tokens=131072 does 400 live; 8192 is Gemma 3's real ceiling.
-    [/gemma.*3/i, { context: 128000, output: 8192 }],
+    // Gemma 4 31B: 128K ctx / 65,536 output (verified on this deployment).
+    [
+        /gemma(?:[._-]|\s)*4(?:[._-]|\s)*31b/i,
+        { context: 128000, output: 65536 },
+    ],
+    [/gemma(?:[._-]|\s)*3(?:[._-]|\s)/i, { context: 128000, output: 8192 }],
     [/gemini.*2/i, { context: 1048576, output: 65536 }],
     [/nova.*pro/i, { context: 300000, output: 10000 }],
     [/nova.*lite/i, { context: 300000, output: 5000 }],

@@ -5,11 +5,14 @@ import { streamOpenWebUI } from "./stream";
 
 const realFetch = globalThis.fetch;
 const realRetryBase = process.env.OWUI_RETRY_BASE_MS;
+const realMaxRetries = process.env.OWUI_MAX_RETRIES;
 process.env.OWUI_RETRY_BASE_MS = "1";
 afterEach(() => {
     globalThis.fetch = realFetch;
     if (realRetryBase === undefined) process.env.OWUI_RETRY_BASE_MS = "1";
     else process.env.OWUI_RETRY_BASE_MS = realRetryBase;
+    if (realMaxRetries === undefined) delete process.env.OWUI_MAX_RETRIES;
+    else process.env.OWUI_MAX_RETRIES = realMaxRetries;
 });
 
 function rawResponse(
@@ -447,6 +450,32 @@ test("tool-call-only streams settle as toolUse, not empty", async () => {
     expect(call.arguments).toEqual({ path: "a" });
 });
 
+test("x-should-retry:true retries an otherwise permanent status", async () => {
+    const { events, calls } = await collectFrom([
+        () =>
+            new Response("try again", {
+                status: 418,
+                headers: { "x-should-retry": "true" },
+            }),
+        () => sseResponse(OK_STREAM),
+    ]);
+    expect(calls).toBe(2);
+    expect(last(events).type).toBe("done");
+});
+
+test("x-should-retry:false suppresses retry of a transient status", async () => {
+    const { events, calls } = await collectFrom([
+        () =>
+            new Response("do not retry", {
+                status: 503,
+                headers: { "x-should-retry": "false" },
+            }),
+        () => sseResponse(OK_STREAM),
+    ]);
+    expect(calls).toBe(1);
+    expect(last(events).type).toBe("error");
+});
+
 test("regression: hidden reasoning that eats max_tokens is retried once with a larger budget", async () => {
     // Live shape from a 24-way fan-out on 2026-09-04: one redacted reasoning
     // chunk, finish_reason=length, usage 400/400, no text.
@@ -484,18 +513,188 @@ test("regression: hidden reasoning that eats max_tokens is retried once with a l
         return calls === 1 ? sseResponse(exhausted) : sseResponse(OK_STREAM);
     }) as unknown as typeof fetch;
     const events: Captured[] = [];
-    for await (const event of streamOpenWebUI(MODEL, CONTEXT, {
+    const expansionModel = { ...MODEL, maxTokens: 1_600 } as Model<Api>;
+    for await (const event of streamOpenWebUI(expansionModel, CONTEXT, {
         apiKey: "test-token",
-        maxTokens: 400,
     })) {
         events.push(event as unknown as Captured);
     }
-    expect(bodies).toEqual([400, 1600]);
+    expect(bodies).toEqual([533, 1600]);
     expect(events.filter((event) => event.type === "start")).toHaveLength(1);
     expect(last(events).type).toBe("done");
     expect(events.find((event) => event.type === "text_end")?.content).toBe(
         "OK",
     );
+    expect(last(events).message?.usage).toEqual(
+        expect.objectContaining({ input: 35, output: 405, totalTokens: 440 }),
+    );
+});
+
+test("reasoning expansion is one-shot", async () => {
+    const exhausted = [
+        JSON.stringify({ choices: [{ delta: {}, finish_reason: "length" }] }),
+        JSON.stringify({
+            choices: [{ delta: {} }],
+            usage: {
+                prompt_tokens: 2,
+                completion_tokens: 533,
+                total_tokens: 535,
+            },
+        }),
+    ];
+    const model = { ...MODEL, maxTokens: 1_600 } as Model<Api>;
+    let calls = 0;
+    globalThis.fetch = (async () => {
+        calls++;
+        return sseResponse(exhausted);
+    }) as unknown as typeof fetch;
+    const events: Captured[] = [];
+    for await (const event of streamOpenWebUI(model, CONTEXT, {
+        apiKey: "t",
+    })) {
+        events.push(event as unknown as Captured);
+    }
+    expect(calls).toBe(2);
+    expect(last(events).type).toBe("error");
+});
+
+test("OWUI_MAX_RETRIES=0 disables reasoning-budget expansion", async () => {
+    process.env.OWUI_MAX_RETRIES = "0";
+    const exhausted = [
+        JSON.stringify({ choices: [{ delta: {}, finish_reason: "length" }] }),
+        JSON.stringify({
+            choices: [{ delta: {} }],
+            usage: {
+                prompt_tokens: 2,
+                completion_tokens: 533,
+                total_tokens: 535,
+            },
+        }),
+    ];
+    const model = { ...MODEL, maxTokens: 1_600 } as Model<Api>;
+    let calls = 0;
+    globalThis.fetch = (async () => {
+        calls++;
+        return sseResponse(exhausted);
+    }) as unknown as typeof fetch;
+    const events: Captured[] = [];
+    for await (const event of streamOpenWebUI(model, CONTEXT, {
+        apiKey: "t",
+    })) {
+        events.push(event as unknown as Captured);
+    }
+    expect(calls).toBe(1);
+    expect(last(events).type).toBe("error");
+});
+
+test("reasoning-budget expansion is restricted to GPT-5", async () => {
+    const exhausted = [
+        JSON.stringify({ choices: [{ delta: {}, finish_reason: "length" }] }),
+        JSON.stringify({
+            choices: [{ delta: {} }],
+            usage: {
+                prompt_tokens: 2,
+                completion_tokens: 533,
+                total_tokens: 535,
+            },
+        }),
+    ];
+    const model = {
+        ...MODEL,
+        id: "google.gemma-4-31b",
+        maxTokens: 1_600,
+    } as Model<Api>;
+    const budgets: number[] = [];
+    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+        budgets.push(
+            (JSON.parse(String(init?.body)) as { max_tokens: number })
+                .max_tokens,
+        );
+        return sseResponse(exhausted);
+    }) as unknown as typeof fetch;
+    const events: Captured[] = [];
+    for await (const event of streamOpenWebUI(model, CONTEXT, {
+        apiKey: "t",
+    })) {
+        events.push(event as unknown as Captured);
+    }
+    expect(budgets).toEqual([533, 533, 533]);
+    expect(last(events).type).toBe("error");
+});
+
+test("explicit maxTokens is a caller policy and is never expanded", async () => {
+    const exhausted = [
+        JSON.stringify({ choices: [{ delta: {}, finish_reason: "length" }] }),
+        JSON.stringify({
+            choices: [{ delta: {} }],
+            usage: {
+                prompt_tokens: 2,
+                completion_tokens: 400,
+                total_tokens: 402,
+            },
+        }),
+    ];
+    let explicitCalls = 0;
+    globalThis.fetch = (async () => {
+        explicitCalls++;
+        return sseResponse(exhausted);
+    }) as unknown as typeof fetch;
+    const explicitEvents: Captured[] = [];
+    for await (const event of streamOpenWebUI(MODEL, CONTEXT, {
+        apiKey: "t",
+        maxTokens: 400,
+    })) {
+        explicitEvents.push(event as unknown as Captured);
+    }
+    expect(explicitCalls).toBe(1);
+    expect(last(explicitEvents).type).toBe("error");
+});
+
+test("final success without usage cannot inherit or omit discarded-attempt usage", async () => {
+    const exhausted = [
+        JSON.stringify({ choices: [{ delta: {}, finish_reason: "length" }] }),
+        JSON.stringify({
+            choices: [{ delta: {} }],
+            usage: {
+                prompt_tokens: 2,
+                completion_tokens: 533,
+                total_tokens: 535,
+            },
+        }),
+    ];
+    const successWithoutUsage = [
+        JSON.stringify({ choices: [{ delta: { content: "OK" } }] }),
+        JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] }),
+    ];
+    const model = { ...MODEL, maxTokens: 1_600 } as Model<Api>;
+    const served = serve([
+        () => sseResponse(exhausted),
+        () => sseResponse(successWithoutUsage),
+    ]);
+    const events: Captured[] = [];
+    for await (const event of streamOpenWebUI(model, CONTEXT, {
+        apiKey: "t",
+    })) {
+        events.push(event as unknown as Captured);
+    }
+    expect(served.calls()).toBe(2);
+    expect(last(events).type).toBe("error");
+    expect(last(events).error?.errorMessage).toContain(
+        "cannot be accounted honestly",
+    );
+});
+
+test("a discarded expansion attempt without usage fails closed", async () => {
+    const exhaustedWithoutUsage = [
+        JSON.stringify({ choices: [{ delta: {}, finish_reason: "length" }] }),
+    ];
+    const { events, calls } = await collectFrom([
+        () => sseResponse(exhaustedWithoutUsage),
+        () => sseResponse(OK_STREAM),
+    ]);
+    expect(calls).toBe(1);
+    expect(last(events).type).toBe("error");
+    expect(last(events).error?.errorMessage).toContain("usage");
 });
 
 test("regression: a thrown 'fetch failed' is retried, an abort is not", async () => {

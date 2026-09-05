@@ -14,6 +14,7 @@ import {
 } from "@earendil-works/pi-ai";
 import {
     AUTH_RETRY_STATUSES,
+    abortableDelay,
     backoffDelayMs,
     carriedNoContent,
     classifySseFrame,
@@ -31,8 +32,6 @@ import {
     type OpenAIChunk,
     oidcLogin,
     parseUsageFromBuffer,
-    RATE_LIMIT_STATUS,
-    RETRY_STATUSES,
     reachedTerminalFrame,
     recordFrame,
     Storage,
@@ -165,14 +164,30 @@ export function streamOpenWebUI(
         );
         const url = `${baseUrl}/api/chat/completions`;
 
-        // Hidden reasoning counts against max_tokens on Bedrock gpt-5.x: a
-        // budget the model spends entirely on reasoning ends with
-        // finish_reason=length and no text. Start from the caller's budget and
-        // grow it once, up to the model cap, when that happens.
+        // Hidden reasoning counts against max_tokens on Bedrock GPT-5.x. Only
+        // an implicit default may be expanded: an explicit maxTokens is caller
+        // policy. Expansion is one-shot and consumes the request retry budget.
+        const explicitMaxTokens = options?.maxTokens !== undefined;
         let maxTokens = Math.min(
             options?.maxTokens ?? Math.floor(model.maxTokens / 3),
             model.maxTokens,
         );
+        let didReasoningExpansion = false;
+        const discardedUsage = {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 0,
+        };
+        const accountDiscardedAttempt = () => {
+            discardedUsage.input += output.usage.input;
+            discardedUsage.output += output.usage.output;
+            discardedUsage.cacheRead += output.usage.cacheRead;
+            discardedUsage.cacheWrite += output.usage.cacheWrite;
+            discardedUsage.totalTokens += output.usage.totalTokens;
+            resetUsage(output, model);
+        };
         const buildPayload = () =>
             buildOpenAIRequest(model.id, context, {
                 maxTokens,
@@ -224,7 +239,7 @@ export function streamOpenWebUI(
                         log(
                             `[pi-stream] ${tag} retry #${attempt} in ${Math.round(delay)}ms after ${res.status}`,
                         );
-                        await new Promise((r) => setTimeout(r, delay));
+                        await abortableDelay(delay, signal);
                     }
                 }
 
@@ -254,7 +269,7 @@ export function streamOpenWebUI(
                         "pi",
                         `${tag} attempt=${attempt} outcome=network-error retry_in_ms=${Math.round(delay)} err="${truncateForLog(err instanceof Error ? err.message : String(err))}"`,
                     );
-                    await new Promise((r) => setTimeout(r, delay));
+                    await abortableDelay(delay, signal);
                     attempt--; // transport failures have their own budget
                     continue;
                 }
@@ -286,10 +301,12 @@ export function streamOpenWebUI(
                     }
                 }
 
-                const retryable =
-                    res.status === RATE_LIMIT_STATUS ||
-                    RETRY_STATUSES.has(res.status);
-                if (!retryable || attempt >= retryBudget) break;
+                const retryDelay = nextRetryDelayMs(
+                    res,
+                    attempt + 1,
+                    res.headers.get("x-should-retry"),
+                );
+                if (retryDelay === undefined || attempt >= retryBudget) break;
             }
             const detail = res
                 ? `${res.status} ${truncateForLog(await peekBody(res), 500)}`
@@ -333,33 +350,68 @@ export function streamOpenWebUI(
                         res = await fetchOk();
                         continue;
                     }
-                    if (
+                    const exhaustedReasoningBudget =
                         err.kind === "empty" &&
                         diag.finishReason === "length" &&
-                        maxTokens < model.maxTokens
-                    ) {
+                        /^openai[._-]gpt[._-]?5/i.test(model.id);
+                    if (exhaustedReasoningBudget) {
+                        const canExpandReasoning =
+                            !explicitMaxTokens &&
+                            !didReasoningExpansion &&
+                            retryBudget > 0 &&
+                            streamAttempt < retryBudget &&
+                            maxTokens < model.maxTokens;
+                        if (!canExpandReasoning) throw err;
+                        if (output.usage.totalTokens <= 0) {
+                            throw new StreamFailure(
+                                "Cannot retry a consumed reasoning budget without provider usage; discarded-attempt accounting would be incomplete",
+                                "empty",
+                                false,
+                            );
+                        }
+                        accountDiscardedAttempt();
+                        didReasoningExpansion = true;
                         maxTokens = Math.min(maxTokens * 4, model.maxTokens);
                         body = buildPayload();
                         payload = JSON.stringify(body);
                         log(
-                            `[pi-stream] ${tag} reasoning consumed the whole output budget; retrying with max_tokens=${maxTokens}`,
+                            `[pi-stream] ${tag} reasoning consumed the whole output budget; retrying once with max_tokens=${maxTokens}`,
                         );
                         res = await fetchOk();
                         continue;
                     }
                     if (err.retryable && streamAttempt < retryBudget) {
+                        if (output.usage.totalTokens > 0)
+                            accountDiscardedAttempt();
                         const delay = backoffDelayMs(streamAttempt + 1);
                         log(
                             `[pi-stream] ${tag} stream retry #${streamAttempt + 1} in ${Math.round(delay)}ms after ${err.kind}`,
                         );
-                        await new Promise((r) => setTimeout(r, delay));
+                        await abortableDelay(delay, signal);
                         res = await fetchOk();
                         continue;
                     }
                     throw err;
                 }
 
-                // Account usage into the shared store (best effort).
+                if (
+                    discardedUsage.totalTokens > 0 &&
+                    output.usage.totalTokens <= 0
+                ) {
+                    throw new StreamFailure(
+                        "Final response omitted usage after a discarded paid attempt; total usage cannot be accounted honestly",
+                        "empty",
+                        false,
+                    );
+                }
+                output.usage.input += discardedUsage.input;
+                output.usage.output += discardedUsage.output;
+                output.usage.cacheRead += discardedUsage.cacheRead;
+                output.usage.cacheWrite += discardedUsage.cacheWrite;
+                output.usage.totalTokens += discardedUsage.totalTokens;
+                output.usage.cost = calculateCost(model, output.usage);
+
+                // Account every provider-reported attempt into the shared store.
                 if (account && output.usage.totalTokens > 0) {
                     await storage
                         .addUsage(account.name, {
@@ -621,6 +673,15 @@ class ChunkWriter {
     get hasToolCalls() {
         return this.toolCalls.size > 0;
     }
+}
+
+function resetUsage(output: AssistantMessage, model: Model<Api>): void {
+    output.usage.input = 0;
+    output.usage.output = 0;
+    output.usage.cacheRead = 0;
+    output.usage.cacheWrite = 0;
+    output.usage.totalTokens = 0;
+    output.usage.cost = calculateCost(model, output.usage);
 }
 
 function applyUsage(

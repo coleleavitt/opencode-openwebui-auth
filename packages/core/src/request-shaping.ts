@@ -209,6 +209,9 @@ export function scrubBedrockToolFields(body: unknown): unknown {
             delete obj.tools;
             delete obj.tool_choice;
             delete obj.parallel_tool_calls;
+            if (messagesReferenceTools(obj.messages)) {
+                obj.tools = [DUMMY_TOOL];
+            }
         } else if (choiceType === "any" || choiceType === "required") {
             // Bedrock supports "auto" and specific tool choice; coerce
             // "any"/"required" to "auto" (closest semantic equivalent).

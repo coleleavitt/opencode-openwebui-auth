@@ -380,6 +380,46 @@ describe("owuiFetch chat/completions admission", () => {
         });
     });
 
+    for (const [name, sse] of [
+        [
+            "error frame",
+            'data: {"error":{"message":"upstream failed","code":"503"}}\n\n',
+        ],
+        [
+            "truncated stream",
+            'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n',
+        ],
+        [
+            "empty completion",
+            'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+        ],
+    ] as const) {
+        it(`rejects a 200 SSE ${name} before exposing success`, async () => {
+            await withStore(async (storage) => {
+                globalThis.fetch = (async () =>
+                    new Response(sse, {
+                        status: 200,
+                        headers: { "content-type": "text/event-stream" },
+                    })) as unknown as typeof fetch;
+                const res = await makeOwuiFetch(storage)(
+                    "https://placeholder/v1/chat/completions",
+                    {
+                        method: "POST",
+                        body: JSON.stringify({
+                            model: "m",
+                            stream: true,
+                            messages: [{ role: "user", content: "hi" }],
+                        }),
+                    },
+                );
+                expect(res.status).toBe(502);
+                expect((await res.json()) as unknown).toEqual(
+                    expect.objectContaining({ error: expect.any(Object) }),
+                );
+            });
+        });
+    }
+
     it("passes an event stream through unchanged while recording diagnostics", async () => {
         await withStore(async (storage) => {
             const sse =

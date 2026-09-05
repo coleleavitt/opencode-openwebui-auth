@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import {
     AUTH_RETRY_STATUSES,
+    abortableDelay,
     backoffDelayMs,
     carriedNoContent,
     formatStreamDiagnostics,
@@ -188,113 +189,70 @@ function rewriteUrl(input: string | URL | Request, baseUrl: string): URL {
     return target;
 }
 
-function interceptUsage(
+async function interceptUsage(
     res: Response,
     storage: Storage,
     accountName: string,
     modelId: string | undefined,
-): Response {
+): Promise<Response> {
     if (!res.body) return res;
 
-    const [userStream, usageStream] = res.body.tee();
-    const abortController = new AbortController();
+    const started = Date.now();
+    const raw = await res.text();
+    const diag = newStreamDiagnostics();
+    let carry = scanSseText(diag, raw, "", (chunk) =>
+        recordChunkContent(diag, chunk),
+    );
+    if (carry.trim().length > 0) {
+        carry = scanSseText(diag, "\n", carry);
+    }
 
-    const userReader = userStream.getReader();
-    const wrappedUserStream = new ReadableStream({
-        async pull(controller) {
-            try {
-                const { done, value } = await userReader.read();
-                if (done) {
-                    controller.close();
-                } else {
-                    controller.enqueue(value);
-                }
-            } catch (e) {
-                controller.error(e);
-            }
-        },
-        cancel() {
-            userReader.releaseLock();
-            abortController.abort();
-        },
-    });
-
-    (async () => {
-        const reader = usageStream.getReader();
-        const diag = newStreamDiagnostics();
-        const started = Date.now();
-        let carry = "";
-        let rawTail = "";
-        try {
-            const decoder = new TextDecoder();
-            let buffer = "";
-            while (true) {
-                if (abortController.signal.aborted) break;
-                const { done, value } = await reader.read();
-                if (done) break;
-                const text = decoder.decode(value as Uint8Array | undefined, {
-                    stream: true,
-                });
-                diag.bytes += value?.byteLength ?? 0;
-                carry = scanSseText(diag, text, carry, (chunk) =>
-                    recordChunkContent(diag, chunk),
-                );
-                buffer += text;
-                if (buffer.length > 4096) {
-                    buffer = buffer.slice(-4096);
-                }
-                rawTail += text;
-                if (rawTail.length > 16384) rawTail = rawTail.slice(-16384);
-            }
-
-            if (carry.trim().length > 0) scanSseText(diag, "\n", carry);
-            const usage = parseUsageFromBuffer(buffer);
-            if (usage) {
-                log(
-                    `[usage] ${accountName} model=${modelId ?? "unknown"}: in=${usage.input} out=${usage.output} cache_read=${usage.cacheRead}`,
-                );
-                await storage.addUsage(accountName, {
-                    ...usage,
-                    model: modelId,
-                });
-            }
-            // opencode parses the stream itself; this side only records what
-            // the proxy sent so an error frame, a truncated body or an empty
-            // completion is visible in the log instead of vanishing.
-            const suspicious =
-                diag.firstError !== undefined ||
-                !reachedTerminalFrame(diag) ||
-                carriedNoContent(diag);
-            logStream(
-                "opencode",
-                `model=${modelId ?? "unknown"} ms=${Date.now() - started} outcome=${
-                    diag.firstError
-                        ? "error-frame"
-                        : !reachedTerminalFrame(diag)
-                          ? "truncated"
-                          : carriedNoContent(diag)
-                            ? "empty"
-                            : "ok"
-                } ${formatStreamDiagnostics(diag)}`,
+    const usage = parseUsageFromBuffer(raw);
+    if (usage) {
+        log(
+            `[usage] ${accountName} model=${modelId ?? "unknown"}: in=${usage.input} out=${usage.output} cache_read=${usage.cacheRead}`,
+        );
+        await storage
+            .addUsage(accountName, { ...usage, model: modelId })
+            .catch((error) =>
+                log(`[usage-extract] failed: ${error?.message ?? error}`),
             );
-            if (suspicious) {
-                logDebugArtifact(
-                    "opencode-stream-failures",
-                    `model=${modelId ?? "unknown"} ${formatStreamDiagnostics(diag)}`,
-                    rawTail,
-                );
-            }
-        } catch {
-            // Usage tracking is best-effort
-        } finally {
-            reader.releaseLock();
-            try {
-                await usageStream.cancel();
-            } catch {}
-        }
-    })().catch((e) => log(`[usage-extract] failed: ${e?.message ?? e}`));
+    }
 
-    return new Response(wrappedUserStream, {
+    const outcome = diag.firstError
+        ? "error-frame"
+        : !reachedTerminalFrame(diag)
+          ? "truncated"
+          : carriedNoContent(diag)
+            ? "empty"
+            : "ok";
+    logStream(
+        "opencode",
+        `model=${modelId ?? "unknown"} ms=${Date.now() - started} outcome=${outcome} ${formatStreamDiagnostics(diag)}`,
+    );
+    if (outcome !== "ok") {
+        logDebugArtifact(
+            "opencode-stream-failures",
+            `model=${modelId ?? "unknown"} ${formatStreamDiagnostics(diag)}`,
+            raw.slice(-16384),
+        );
+        const message =
+            diag.firstError?.message ??
+            (outcome === "truncated"
+                ? "OpenWebUI stream ended without a terminal frame"
+                : "OpenWebUI returned an empty completion");
+        return new Response(
+            JSON.stringify({
+                error: { message, type: "proxy_error", code: 502 },
+            }),
+            {
+                status: 502,
+                headers: { "content-type": "application/json" },
+            },
+        );
+    }
+
+    return new Response(raw, {
         status: res.status,
         statusText: res.statusText,
         headers: res.headers,
@@ -418,7 +376,7 @@ export function makeOwuiFetch(storage: Storage) {
                 log(
                     `[fetch] retry #${attempt} in ${Math.round(delay)}ms after ${lastRes?.status ?? "?"}...`,
                 );
-                await new Promise((r) => setTimeout(r, delay));
+                await abortableDelay(delay, combinedSignal);
             }
 
             logRequest(url.toString(), init?.method ?? "GET");
@@ -439,7 +397,7 @@ export function makeOwuiFetch(storage: Storage) {
                     "opencode",
                     `model=${requestModelId ?? "unknown"} outcome=network-error retry_in_ms=${Math.round(delay)} err="${truncateForLog(err instanceof Error ? err.message : String(err))}"`,
                 );
-                await new Promise((r) => setTimeout(r, delay));
+                await abortableDelay(delay, combinedSignal);
                 attempt--; // transport failures have their own budget
                 continue;
             }
@@ -478,8 +436,13 @@ export function makeOwuiFetch(storage: Storage) {
                         },
                     );
                 }
-                if (isChatCompletions && res.body && accountForUsage) {
-                    return interceptUsage(
+                if (
+                    isChatCompletions &&
+                    res.body &&
+                    accountForUsage &&
+                    contentType.includes("text/event-stream")
+                ) {
+                    return await interceptUsage(
                         res,
                         storage,
                         accountForUsage,

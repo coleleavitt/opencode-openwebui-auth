@@ -24,11 +24,10 @@ export function maxRetries(): number {
     return Number.isInteger(raw) && raw >= 0 && raw <= 10 ? raw : MAX_RETRIES;
 }
 
-// Errors thrown by fetch itself (no Response) when the socket dies: undici's
-// "fetch failed" wraps the cause. A short OWUI restart shows up as a burst of
-// these; the 2026-09-02 21:10-21:15 window produced 12 in one session.
-const TRANSIENT_NETWORK_SIGNATURES = [
-    "fetch failed",
+// Errors thrown by fetch itself (no Response) when the socket dies. Undici's
+// generic "fetch failed" wrapper is not evidence by itself: its cause decides
+// whether a retry is safe.
+const TRANSIENT_NETWORK_CODES = new Set([
     "ECONNRESET",
     "ECONNREFUSED",
     "ETIMEDOUT",
@@ -38,10 +37,21 @@ const TRANSIENT_NETWORK_SIGNATURES = [
     "UND_ERR_CONNECT_TIMEOUT",
     "UND_ERR_HEADERS_TIMEOUT",
     "UND_ERR_BODY_TIMEOUT",
+]);
+const TRANSIENT_NETWORK_MESSAGES = [
     "socket hang up",
     "other side closed",
     "terminated",
 ];
+const PERMANENT_NETWORK_CODES = new Set([
+    "CERT_HAS_EXPIRED",
+    "DEPTH_ZERO_SELF_SIGNED_CERT",
+    "SELF_SIGNED_CERT_IN_CHAIN",
+    "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+    "ERR_INVALID_URL",
+    "ERR_INVALID_PROTOCOL",
+    "ERR_SOCKET_BAD_PORT",
+]);
 
 /** True for a thrown transport error worth one bounded retry; never for aborts. */
 export function isTransientNetworkError(error: unknown): boolean {
@@ -50,15 +60,35 @@ export function isTransientNetworkError(error: unknown): boolean {
         return false;
     const seen = new Set<unknown>();
     let current: unknown = error;
+    let transient = false;
     while (current instanceof Error && !seen.has(current)) {
         seen.add(current);
+        if (current.name === "AbortError" || current.name === "TimeoutError")
+            return false;
         const code = (current as { code?: unknown }).code;
-        const text = `${current.name} ${current.message} ${typeof code === "string" ? code : ""}`;
-        if (TRANSIENT_NETWORK_SIGNATURES.some((sig) => text.includes(sig)))
-            return true;
+        if (typeof code === "string") {
+            if (
+                PERMANENT_NETWORK_CODES.has(code) ||
+                code.startsWith("CERT_") ||
+                code.startsWith("ERR_TLS_") ||
+                code.startsWith("ERR_SSL_")
+            ) {
+                return false;
+            }
+            if (TRANSIENT_NETWORK_CODES.has(code)) transient = true;
+        }
+        if (
+            TRANSIENT_NETWORK_MESSAGES.some((signature) =>
+                current instanceof Error
+                    ? current.message.includes(signature)
+                    : false,
+            )
+        ) {
+            transient = true;
+        }
         current = (current as { cause?: unknown }).cause;
     }
-    return false;
+    return transient;
 }
 
 /** Cap the honored Retry-After so a hostile/buggy header can't stall a request. */
@@ -115,6 +145,22 @@ export function retryBaseMs(): number {
     return Number.isFinite(raw) && raw >= 0 ? raw : RETRY_BASE_MS;
 }
 
+/** Wait for a retry without outliving cancellation of the originating request. */
+export function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
+    if (signal.aborted) return Promise.reject(signal.reason);
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+            signal.removeEventListener("abort", onAbort);
+            resolve();
+        }, ms);
+        const onAbort = () => {
+            clearTimeout(timer);
+            reject(signal.reason);
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+    });
+}
+
 /** Jittered exponential backoff for retry attempt N (1-based). */
 export function backoffDelayMs(attempt: number): number {
     return retryBaseMs() * 2 ** (attempt - 1) * (0.5 + Math.random() * 0.5);
@@ -130,6 +176,7 @@ export function nextRetryDelayMs(
     attempt: number,
     xShouldRetry?: string | null,
 ): number | undefined {
+    if (xShouldRetry === "false") return undefined;
     if (res.status === RATE_LIMIT_STATUS) {
         const retryAfter = parseRetryAfterMs(res);
         return retryAfter !== undefined

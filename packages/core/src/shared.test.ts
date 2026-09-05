@@ -1,9 +1,11 @@
 import { describe, expect, it } from "bun:test";
 import {
+    abortableDelay,
     backoffDelayMs,
     buildClaudeVariants,
     inferModelLimits,
     isRetryableErrorBody,
+    isTransientNetworkError,
     MAX_RETRY_AFTER_MS,
     messagesReferenceTools,
     nextRetryDelayMs,
@@ -52,6 +54,9 @@ describe("nextRetryDelayMs", () => {
     it("respects x-should-retry:false override", () => {
         expect(nextRetryDelayMs(resWith(503), 1, "false")).toBeUndefined();
     });
+    it("respects x-should-retry:false override on 429", () => {
+        expect(nextRetryDelayMs(resWith(429), 1, "false")).toBeUndefined();
+    });
     it("respects x-should-retry:true override", () => {
         expect(nextRetryDelayMs(resWith(418), 1, "true")).toBeGreaterThan(0);
     });
@@ -96,6 +101,17 @@ describe("messagesReferenceTools", () => {
 });
 
 describe("scrubBedrockToolFields", () => {
+    it("keeps a dummy tool after tool_choice:none when history references tools", () => {
+        const body = scrubBedrockToolFields({
+            messages: [{ role: "tool", tool_call_id: "call_1", content: "ok" }],
+            tools: [{ type: "function", function: { name: "real" } }],
+            tool_choice: { type: "none" },
+        }) as Record<string, unknown>;
+        expect(Array.isArray(body.tools)).toBe(true);
+        expect(body.tools).toHaveLength(1);
+        expect(body.tool_choice).toBeUndefined();
+    });
+
     it("drops tool_choice:none and its tools", () => {
         const body = scrubBedrockToolFields({
             tools: [{ type: "function" }],
@@ -369,6 +385,7 @@ describe("inferModelLimits (OWUI/LiteLLM+Bedrock, verified live + catalog)", () 
         ["openai.gpt-5.6-luna", 1_050_000, 128_000],
         ["openai.gpt-oss-120b-1:0", 128_000, 128_000],
         ["google.gemma-3-12b-it", 128_000, 8_192],
+        ["google.gemma-4-31b", 128_000, 65_536],
         ["meta.llama4-maverick-17b-instruct-v1:0", 1_000_000, 8_192],
     ];
     for (const [id, context, output] of cases) {
@@ -473,5 +490,34 @@ describe("buildClaudeVariants (shapes verified live against OWUI/LiteLLM+Bedrock
         expect(
             buildClaudeVariants("bedrock-claude-4-6-opus").xhigh,
         ).toBeDefined();
+    });
+});
+
+describe("isTransientNetworkError", () => {
+    it("does not retry permanent TLS failures wrapped by fetch failed", () => {
+        const error = new TypeError("fetch failed", {
+            cause: Object.assign(new Error("certificate has expired"), {
+                code: "CERT_HAS_EXPIRED",
+            }),
+        });
+        expect(isTransientNetworkError(error)).toBe(false);
+    });
+
+    it("does not retry bad-port/config failures wrapped by fetch failed", () => {
+        const error = new TypeError("fetch failed", {
+            cause: new Error("bad port"),
+        });
+        expect(isTransientNetworkError(error)).toBe(false);
+    });
+});
+
+describe("abortableDelay", () => {
+    it("rejects promptly when a request is aborted during backoff", async () => {
+        const controller = new AbortController();
+        const started = Date.now();
+        const waiting = abortableDelay(30_000, controller.signal);
+        controller.abort(new DOMException("cancelled", "AbortError"));
+        await expect(waiting).rejects.toThrow("cancelled");
+        expect(Date.now() - started).toBeLessThan(1000);
     });
 });
