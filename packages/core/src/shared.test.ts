@@ -304,12 +304,25 @@ describe("parseUsageFromBuffer", () => {
         const buf =
             'data: {"usage":{"prompt_tokens":10,"completion_tokens":5,"cached_tokens":2}}';
         expect(parseUsageFromBuffer(buf)).toEqual({
-            input: 10,
+            input: 8,
             output: 5,
             cacheRead: 2,
             cacheWrite: 0,
+            totalTokens: 15,
         });
     });
+    it("makes prompt cache tokens disjoint without inflating provider totals", () => {
+        const buf =
+            'data: {"usage":{"prompt_tokens":100,"completion_tokens":5,"total_tokens":105,"prompt_tokens_details":{"cached_tokens":20,"cache_creation_tokens":30}}}';
+        expect(parseUsageFromBuffer(buf)).toEqual({
+            input: 50,
+            output: 5,
+            cacheRead: 20,
+            cacheWrite: 30,
+            totalTokens: 105,
+        });
+    });
+
     it("returns undefined without a usage block", () => {
         expect(parseUsageFromBuffer("data: {}")).toBeUndefined();
     });
@@ -323,20 +336,22 @@ describe("parseUsageFromBuffer", () => {
             "data: [DONE]",
         ].join("\n");
         expect(parseUsageFromBuffer(buf)).toEqual({
-            input: 11,
+            input: 1,
             output: 5,
             cacheRead: 7,
             cacheWrite: 3,
+            totalTokens: 16,
         });
     });
     it("recovers a usage object from a buffer whose head was cut mid-frame", () => {
         const buf =
             'ent":"x"}}]}\ndata: {"choices":[],"usage":{"completion_tokens":2,"prompt_tokens":3,"prompt_tokens_details":{"cached_tokens":1}}}';
         expect(parseUsageFromBuffer(buf.slice(20))).toEqual({
-            input: 3,
+            input: 2,
             output: 2,
             cacheRead: 1,
             cacheWrite: 0,
+            totalTokens: 5,
         });
     });
 });

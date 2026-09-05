@@ -633,8 +633,7 @@ function applyUsage(
     output.usage.output = usage.output;
     output.usage.cacheRead = usage.cacheRead;
     output.usage.cacheWrite = usage.cacheWrite;
-    output.usage.totalTokens =
-        usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+    output.usage.totalTokens = usage.totalTokens;
     output.usage.cost = calculateCost(model, output.usage);
 }
 

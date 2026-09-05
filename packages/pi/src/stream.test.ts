@@ -62,7 +62,13 @@ interface Captured {
     message?: {
         content: unknown[];
         stopReason: string;
-        usage: { totalTokens: number };
+        usage: {
+            input: number;
+            output: number;
+            cacheRead: number;
+            cacheWrite: number;
+            totalTokens: number;
+        };
     };
 }
 
@@ -263,6 +269,32 @@ test("a transient stream failure followed by a good stream yields one clean comp
     expect(done.type).toBe("done");
     expect(done.message?.stopReason).toBe("stop");
     expect(done.message?.usage.totalTokens).toBe(16);
+});
+
+test("usage keeps prompt cache tokens disjoint and honors provider total_tokens", async () => {
+    const events = await collect([
+        JSON.stringify({ choices: [{ delta: { content: "OK" } }] }),
+        JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] }),
+        JSON.stringify({
+            choices: [{ delta: {} }],
+            usage: {
+                prompt_tokens: 100,
+                completion_tokens: 5,
+                total_tokens: 105,
+                prompt_tokens_details: {
+                    cached_tokens: 20,
+                    cache_creation_tokens: 30,
+                },
+            },
+        }),
+    ]);
+    expect(last(events).message?.usage).toMatchObject({
+        input: 50,
+        output: 5,
+        cacheRead: 20,
+        cacheWrite: 30,
+        totalTokens: 105,
+    });
 });
 
 test("an error frame after content was emitted fails without a retry", async () => {

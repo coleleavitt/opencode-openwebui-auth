@@ -8,11 +8,13 @@ export interface ParsedUsage {
     output: number;
     cacheRead: number;
     cacheWrite: number;
+    totalTokens: number;
 }
 
 interface UsageObject {
     prompt_tokens?: number;
     completion_tokens?: number;
+    total_tokens?: number;
     prompt_tokens_details?: {
         cached_tokens?: number;
         cache_write_tokens?: number;
@@ -35,21 +37,36 @@ export function parseUsageObject(usage: unknown): ParsedUsage | undefined {
     const obj = usage as UsageObject;
     if (typeof obj.completion_tokens !== "number") return undefined;
     const details = obj.prompt_tokens_details;
+    const prompt = toCount(obj.prompt_tokens);
+    const output = toCount(obj.completion_tokens);
+    // LiteLLM reports Bedrock cache reads in prompt_tokens_details.cached_tokens
+    // and (newer builds) also as top-level cache_read_input_tokens.
+    const cacheRead = toCount(
+        details?.cached_tokens ??
+            obj.cache_read_input_tokens ??
+            obj.cached_tokens,
+    );
+    const cacheWrite = toCount(
+        details?.cache_write_tokens ??
+            details?.cache_creation_tokens ??
+            obj.cache_creation_input_tokens,
+    );
+    const reportedTotal =
+        typeof obj.total_tokens === "number" &&
+        Number.isFinite(obj.total_tokens) &&
+        obj.total_tokens >= 0
+            ? Math.floor(obj.total_tokens)
+            : undefined;
+    const totalTokens = reportedTotal ?? prompt + output;
     return {
-        input: toCount(obj.prompt_tokens),
-        output: toCount(obj.completion_tokens),
-        // LiteLLM reports Bedrock cache reads in prompt_tokens_details.cached_tokens
-        // and (newer builds) also as top-level cache_read_input_tokens.
-        cacheRead: toCount(
-            details?.cached_tokens ??
-                obj.cache_read_input_tokens ??
-                obj.cached_tokens,
-        ),
-        cacheWrite: toCount(
-            details?.cache_write_tokens ??
-                details?.cache_creation_tokens ??
-                obj.cache_creation_input_tokens,
-        ),
+        // OpenAI-compatible prompt_tokens includes cached and cache-write tokens.
+        // Prime usage fields are disjoint, so derive uncached input from the
+        // authoritative total when present and from prompt_tokens otherwise.
+        input: Math.max(0, totalTokens - output - cacheRead - cacheWrite),
+        output,
+        cacheRead,
+        cacheWrite,
+        totalTokens,
     };
 }
 
