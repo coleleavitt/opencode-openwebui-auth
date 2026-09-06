@@ -2,7 +2,10 @@ import type {
     OAuthCredentials,
     OAuthLoginCallbacks,
 } from "@earendil-works/pi-ai";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+    ExtensionAPI,
+    ProviderConfig,
+} from "@earendil-works/pi-coding-agent";
 import {
     fetchInstanceConfig,
     inferModelLimits,
@@ -159,6 +162,13 @@ function toPiModel(baseUrl: string, raw: OpenWebUIModelInfo) {
 
 type PiModel = ReturnType<typeof toPiModel>;
 
+/**
+ * A cached catalog younger than this is served at startup without any
+ * discovery request. Older caches are still served immediately, but a refresh
+ * runs in the background and re-registers the provider when the list changed.
+ */
+export const MODEL_CATALOG_MAX_AGE_MS = 10 * 60 * 1000;
+
 /** Injection seams so catalog behaviour is testable without a network or a store. */
 export interface ModelCatalogDeps {
     cache?: ModelCatalogCache<PiModel>;
@@ -167,6 +177,8 @@ export interface ModelCatalogDeps {
         baseUrl: string,
         token: string,
     ) => Promise<{ data: OpenWebUIModelInfo[] }>;
+    /** Cache age below which startup skips discovery (default 10 minutes). */
+    maxAgeMs?: number;
 }
 
 /**
@@ -206,15 +218,85 @@ export async function resolvePiModelCatalog(
     return cached.models;
 }
 
-export default async function openWebUiPiAuth(pi: ExtensionAPI) {
-    const models = await resolvePiModelCatalog();
-    // The provider must advertise the host the models and the stream actually
-    // use. The env default is only a fallback for a first-time login, so a
-    // stored account whose host differs no longer leaves the provider record
-    // pointing somewhere the requests never go.
-    const baseUrl = new Storage().getCurrent()?.baseUrl ?? envBaseUrl();
+/** What the provider registers with at startup, plus a possible later update. */
+export interface StartupModelCatalog {
+    models: PiModel[];
+    /** `cache` = served from disk, `live` = awaited discovery, `none` = no account/models. */
+    source: "cache" | "live" | "none";
+    /**
+     * Background discovery for a stale cache. Resolves with the fresh catalog
+     * when it differs from `models`, otherwise `undefined`. Never rejects.
+     */
+    refresh: Promise<PiModel[] | undefined>;
+}
 
-    pi.registerProvider("openwebui", {
+function sameCatalog(a: PiModel[], b: PiModel[]): boolean {
+    return a.length === b.length && JSON.stringify(a) === JSON.stringify(b);
+}
+
+/**
+ * Cache-first catalog for session start.
+ *
+ * The extension factory used to await a live `/api/models` round-trip on every
+ * session start (~200-450 ms, the whole cost of loading this extension). Now a
+ * fresh cache resolves with no network I/O, a stale cache is served at once
+ * while discovery refreshes it in the background, and only a cold start (no
+ * cache for this host) still waits on the network like before.
+ */
+export async function resolveStartupPiModelCatalog(
+    deps: ModelCatalogDeps = {},
+): Promise<StartupModelCatalog> {
+    const cache = deps.cache ?? new ModelCatalogCache<PiModel>();
+    const account = (deps.getAccount ?? (() => new Storage().getCurrent()))();
+    const noRefresh = Promise.resolve(undefined);
+    if (!account) return { models: [], source: "none", refresh: noRefresh };
+
+    const live: ModelCatalogDeps = {
+        ...deps,
+        cache,
+        getAccount: () => account,
+    };
+    const cached = cache.load(account.baseUrl);
+    if (!cached) {
+        const models = await resolvePiModelCatalog(live);
+        return {
+            models,
+            source: models.length > 0 ? "live" : "none",
+            refresh: noRefresh,
+        };
+    }
+
+    const ageMs = Date.now() - cached.fetchedAt;
+    const ageMinutes = Math.round(ageMs / 60_000);
+    if (ageMs < (deps.maxAgeMs ?? MODEL_CATALOG_MAX_AGE_MS)) {
+        log(
+            `[pi] serving ${cached.models.length} cached models for ${account.baseUrl} (${ageMinutes}m old, fresh)`,
+        );
+        return { models: cached.models, source: "cache", refresh: noRefresh };
+    }
+
+    log(
+        `[pi] serving ${cached.models.length} cached models for ${account.baseUrl} (${ageMinutes}m old), refreshing in background`,
+    );
+    // resolvePiModelCatalog never throws: a failed or empty discovery falls
+    // back to the same cached list, which compares equal and yields no update.
+    const refresh = resolvePiModelCatalog(live).then(
+        (fresh) =>
+            fresh.length > 0 && !sameCatalog(fresh, cached.models)
+                ? fresh
+                : undefined,
+        (err) => {
+            log(
+                `[pi] background model refresh failed: ${err instanceof Error ? err.message : err}`,
+            );
+            return undefined;
+        },
+    );
+    return { models: cached.models, source: "cache", refresh };
+}
+
+function providerConfig(baseUrl: string, models: PiModel[]): ProviderConfig {
+    return {
         name: "OpenWebUI (Shibboleth OIDC)",
         baseUrl: `${baseUrl}/api`,
         api: "openai",
@@ -230,5 +312,47 @@ export default async function openWebUiPiAuth(pi: ExtensionAPI) {
         // (429/Retry-After, 5xx, LiteLLM-mislabeled 400), OIDC re-auth, SSE
         // parsing, and usage accounting. Mirrors the opencode fetch shim.
         streamSimple: streamOpenWebUI,
+    };
+}
+
+/** Factory seams: the real one reads the account store and the model cache. */
+export interface OpenWebUiPiAuthDeps {
+    catalog?: ModelCatalogDeps;
+}
+
+export default async function openWebUiPiAuth(
+    pi: ExtensionAPI,
+    deps: OpenWebUiPiAuthDeps = {},
+) {
+    // Read the account store once; the catalog and the provider record share it.
+    const account = (
+        deps.catalog?.getAccount ?? (() => new Storage().getCurrent())
+    )();
+    const catalog = await resolveStartupPiModelCatalog({
+        ...deps.catalog,
+        getAccount: () => account,
+    });
+    // The provider must advertise the host the models and the stream actually
+    // use. The env default is only a fallback for a first-time login, so a
+    // stored account whose host differs no longer leaves the provider record
+    // pointing somewhere the requests never go.
+    const baseUrl = account?.baseUrl ?? envBaseUrl();
+
+    pi.registerProvider("openwebui", providerConfig(baseUrl, catalog.models));
+
+    // A stale cache was served above; when discovery finds a different list,
+    // re-register so the picker sees it. Re-registering with `models` replaces
+    // the provider's model list in pi's registry. The extension may already be
+    // disposed (ctx.reload) by the time this lands; that throw is only logged.
+    void catalog.refresh.then((fresh) => {
+        if (!fresh) return;
+        try {
+            pi.registerProvider("openwebui", providerConfig(baseUrl, fresh));
+            log(`[pi] catalog refreshed: ${fresh.length} models`);
+        } catch (err) {
+            log(
+                `[pi] catalog refresh not applied: ${err instanceof Error ? err.message : err}`,
+            );
+        }
     });
 }
