@@ -40,6 +40,7 @@ import {
 } from "@openwebui-auth/core";
 
 import { buildOpenAIRequest } from "./convert";
+import { recordOpenWebUIStreamDiagnostics } from "./pi-trace";
 
 const SAFETY_TIMEOUT_MS = 10 * 60 * 1000;
 
@@ -334,6 +335,12 @@ export function streamOpenWebUI(
                         model,
                         diag,
                     );
+                    recordOpenWebUIStreamDiagnostics(
+                        requestId,
+                        streamAttempt,
+                        "ok",
+                        diag,
+                    );
                     logStream(
                         "pi",
                         `${tag} outcome=ok stream_attempt=${streamAttempt} ms=${Date.now() - started} stop=${finishReason} ${formatStreamDiagnostics(diag)}`,
@@ -341,6 +348,12 @@ export function streamOpenWebUI(
                 } catch (err) {
                     if (!(err instanceof StreamFailure)) throw err;
                     const emitted = !carriedNoContent(diag);
+                    recordOpenWebUIStreamDiagnostics(
+                        requestId,
+                        streamAttempt,
+                        err.kind,
+                        diag,
+                    );
                     logStream(
                         "pi",
                         `${tag} outcome=${err.kind} stream_attempt=${streamAttempt} ms=${Date.now() - started} retryable=${err.retryable && !emitted} ${formatStreamDiagnostics(diag)}`,
